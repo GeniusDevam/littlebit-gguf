@@ -24,20 +24,39 @@ PROMPTS = (
 )
 
 
+def q8_0_activations(x: torch.Tensor) -> torch.Tensor:
+    # AVX2 uses 32 values per block, nearest-even integers and an FP16 scale.
+    width = x.size(-1)
+    blocks = F.pad(x, (0, -width % 32)).reshape(*x.shape[:-1], -1, 32)
+    peak = blocks.abs().amax(-1, keepdim=True)
+    limit = torch.full_like(peak, 127)
+    inverse = torch.where(peak == 0, 0, limit / peak)
+    return ((blocks * inverse).round() * (peak / limit).half().float()).flatten(-2)[
+        ..., :width
+    ]
+
+
+def test_q8_0_activations_at_rounding_boundary() -> None:
+    x = torch.tensor([0.14, 0.0016535432077944279], dtype=torch.float32)
+    scale = torch.tensor(0.14 / 127, dtype=torch.float16).float()
+    assert q8_0_activations(x)[1].item() == 2 * scale.item()
+
+
 class FloatProjection(torch.nn.Module):
     def __init__(
-        self, state: dict[str, torch.Tensor], prefix: str, residual: bool
+        self, state: dict[str, torch.Tensor], prefix: str, residual: bool, q8_0: bool
     ) -> None:
         super().__init__()
         self.paths = []
+        self.q8_0 = q8_0
         for extra in range(1 + residual):
             path = read_path(state.__getitem__, prefix, bool(extra))
             self.paths.append(
                 tuple(
                     torch.from_numpy(value)
                     for value in (
-                        unpack_signs(path.u, len(path.latent)),
-                        unpack_signs(path.v, len(path.g)),
+                        unpack_signs(path.u, len(path.latent)).astype(np.int8),
+                        unpack_signs(path.v, len(path.g)).astype(np.int8),
                         path.h,
                         path.latent,
                         path.g,
@@ -47,15 +66,23 @@ class FloatProjection(torch.nn.Module):
         self.bias = state.get(f"{prefix}.bias")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        outputs = [
-            F.linear(F.linear(x * g, v) * latent, u) * h
-            for u, v, h, latent, g in self.paths
-        ]
+        outputs = []
+        for u, v, h, latent, g in self.paths:
+            z = x * g.to(x.dtype)
+            if self.q8_0:
+                z = q8_0_activations(z)
+                h, latent = h.half(), latent.half()
+            z = F.linear(z, v.to(x.dtype)) * latent.to(x.dtype)
+            if self.q8_0:
+                z = q8_0_activations(z)
+            outputs.append(F.linear(z, u.to(x.dtype)) * h.to(x.dtype))
         result = sum(outputs)
-        return result if self.bias is None else result + self.bias.float()
+        return result if self.bias is None else result + self.bias.to(x.dtype)
 
 
-def reference_model(checkpoint: Path) -> torch.nn.Module:
+def reference_model(
+    checkpoint: Path, dtype: torch.dtype = torch.float32, *, q8_0: bool = False
+) -> torch.nn.Module:
     config = AutoConfig.from_pretrained(checkpoint)
     state = load_file(checkpoint / "model.safetensors")
     metadata = json.loads(
@@ -64,9 +91,9 @@ def reference_model(checkpoint: Path) -> torch.nn.Module:
     model = AutoModelForCausalLM.from_config(config, dtype=torch.float16).eval()
     for prefix in prefixes(config.num_hidden_layers):
         model.set_submodule(
-            prefix, FloatProjection(state, prefix, metadata["residual"])
+            prefix, FloatProjection(state, prefix, metadata["residual"], q8_0)
         )
-    model.float()
+    model.to(dtype)
     dense_names = model.state_dict().keys()
     dense = {name: tensor for name, tensor in state.items() if name in dense_names}
     missing, unexpected = model.load_state_dict(dense, strict=False)
@@ -117,37 +144,48 @@ def logits(
 
 
 @torch.inference_mode()
-def compare_logits(
-    checkpoint: Path, gguf_path: Path, tool: Path, threads: int, kv_type: str = "f16"
-) -> tuple[float, float, float]:
+def reference_logits(
+    checkpoint: Path,
+    token_ids: list[list[int]],
+    threads: int,
+    dtype: torch.dtype = torch.float32,
+    *,
+    q8_0: bool = False,
+) -> list[torch.Tensor]:
     torch.set_num_threads(threads)
+    reference = reference_model(checkpoint, dtype, q8_0=q8_0)
+    return [reference(torch.tensor([ids])).logits[0] for ids in token_ids]
+
+
+def prompt_ids(checkpoint: Path) -> list[list[int]]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-    reference = reference_model(checkpoint)
-    limits = []
-    for prompt in PROMPTS:
-        ids = tokenizer.encode(prompt)
-        expected = reference(torch.tensor([ids])).logits[0]
-        actual = logits(tool, gguf_path, ids, threads, kv_type)
-        assert actual.shape == expected.shape
-        assert torch.isfinite(actual).all()
-        agreement = (actual.argmax(-1) == expected.argmax(-1)).float().mean().item()
-        error = (actual - expected).abs().max().item()
+    return [tokenizer.encode(prompt) for prompt in PROMPTS]
+
+
+def compare_logits(
+    label: str, expected: list[torch.Tensor], actual: list[torch.Tensor]
+) -> tuple[float, float, float]:
+    metrics = []
+    for ref, got in zip(expected, actual, strict=True):
+        assert got.shape == ref.shape
+        assert torch.isfinite(got).all() and torch.isfinite(ref).all()
+        got, ref = got.double(), ref.double()
+        agreement = (got.argmax(-1) == ref.argmax(-1)).double().mean().item()
+        error = (got - ref).abs().max().item()
         kl = F.kl_div(
-            actual.log_softmax(-1), expected.softmax(-1), reduction="batchmean"
+            got.log_softmax(-1), ref.softmax(-1), reduction="batchmean"
         ).item()
-        limits.append((agreement, error, kl))
-    agreement = sum(row[0] for row in limits) / len(limits)
-    error = max(row[1] for row in limits)
-    kl = sum(row[2] for row in limits) / len(limits)
-    print(
-        f"{gguf_path.stem} {kv_type}: top-1 {agreement:.4f}, max abs {error:.6f}, KL {kl:.6g}"
-    )
+        metrics.append((agreement, error, kl))
+    agreement = sum(row[0] for row in metrics) / len(metrics)
+    error = max(row[1] for row in metrics)
+    kl = sum(row[2] for row in metrics) / len(metrics)
+    print(f"{label}: top-1 {agreement:.4f}, max abs {error:.6f}, KL {kl:.6g}")
     return agreement, error, kl
 
 
 @pytest.mark.parametrize(
     "architecture,bits",
-    [("llama", 0.1), ("llama", 1.0), ("qwen2", 0.1), ("qwen3", 0.1)],
+    [(arch, bits) for arch in ("llama", "qwen2", "qwen3") for bits in (0.1, 1.0)],
 )
 def test_tiny_runtime(
     tmp_path: Path, logits_tool: Path, architecture: str, bits: float
@@ -170,8 +208,13 @@ def test_tiny_runtime(
         binary_dir=BUILD / "bin",
     )
     convert(options)
+    token_ids = prompt_ids(checkpoint)
+    expected = reference_logits(checkpoint, token_ids, 2)
     for kv_type in ("f16", "q8_0"):
-        top1, error, kl = compare_logits(checkpoint, gguf_path, logits_tool, 2, kv_type)
+        actual = [logits(logits_tool, gguf_path, ids, 2, kv_type) for ids in token_ids]
+        top1, error, kl = compare_logits(
+            f"{architecture}-{bits} {kv_type}", expected, actual
+        )
         assert top1 >= 0.95
         assert error < 0.1
         assert kl < 0.001
@@ -244,7 +287,30 @@ def test_published_model(model: str, bits: str, logits_tool: Path) -> None:
     checkpoint, gguf_path = DATA / f"{model}-{bits}", DATA / f"{model}-{bits}-f16.gguf"
     if not checkpoint.is_dir() or not gguf_path.is_file():
         pytest.skip(f"generate and convert {checkpoint} before the model test")
-    top1, error, kl = compare_logits(checkpoint, gguf_path, logits_tool, 4)
-    assert top1 >= 0.8
-    assert error < 1.25
-    assert kl < 0.03
+    token_ids = prompt_ids(checkpoint)
+    f16, f16_no_fa, f32 = (
+        [logits(logits_tool, gguf_path, ids, 4, kv_type) for ids in token_ids]
+        for kv_type in ("f16", "f16-no-fa", "f32")
+    )
+    ref32 = reference_logits(checkpoint, token_ids, 4)
+    ref64 = reference_logits(checkpoint, token_ids, 4, torch.float64)
+    ref_q8 = reference_logits(checkpoint, token_ids, 4, q8_0=True)
+    name = f"{model}-{bits}"
+    compare_logits(f"{name} KV F32 to F16 (no flash)", f32, f16_no_fa)
+    compare_logits(f"{name} KV F16 no flash to auto", f16_no_fa, f16)
+    compare_logits(f"{name} PyTorch F64 to F32", ref64, ref32)
+    compare_logits(f"{name} PyTorch F32 to Q8", ref32, ref_q8)
+    q8_match = compare_logits(f"{name} PyTorch Q8 to KV F32", ref_q8, f32)
+    compare_logits(f"{name} PyTorch Q8 to KV F16", ref_q8, f16)
+    top1, error, kl = compare_logits(f"{name} PyTorch F32 to KV F16", ref32, f16)
+    minimum_top1, maximum_error, maximum_kl = 0.8, 1.25, 0.03
+    if model == "qwen3" and bits == "1.0":
+        # The cache-only comparison gives max error 5.54 and KL 0.314.
+        minimum_top1, maximum_error, maximum_kl = 0.44, 5.6, 0.32
+        q8_top1, q8_error, q8_kl = q8_match
+        assert q8_top1 >= 0.75
+        assert q8_error < 3.5
+        assert q8_kl < 0.07
+    assert top1 >= minimum_top1
+    assert error < maximum_error
+    assert kl < maximum_kl

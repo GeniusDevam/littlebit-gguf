@@ -20,9 +20,17 @@ int main(int argc, char ** argv) try {
     auto params      = llama_context_default_params();
     params.n_ctx     = 256;
     params.n_threads = params.n_threads_batch = std::stoi(argv[2]);
-    if (std::string(argv[3]) == "q8_0") {
+    const std::string kv_type                 = argv[3];
+    if (kv_type == "f32") {
+        params.type_k = params.type_v = GGML_TYPE_F32;
+        params.flash_attn_type        = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    } else if (kv_type == "f16-no-fa") {
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    } else if (kv_type == "q8_0") {
         params.type_k = params.type_v = GGML_TYPE_Q8_0;
         params.flash_attn_type        = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    } else if (kv_type != "f16") {
+        throw std::runtime_error("unsupported KV cache type");
     }
     std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), params), llama_free);
     if (!ctx) {

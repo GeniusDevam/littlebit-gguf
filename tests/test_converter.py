@@ -6,7 +6,7 @@ import torch
 from safetensors.torch import load_file
 from tiny_model import make_tiny_model
 
-from convert_littlebit_to_gguf import Q, gguf, main
+from convert_littlebit_to_gguf import Q, dense_type, gguf, main
 from littlebit import PathFactors, fp16_scale, pack_signs, q1_blocks, unpack_signs
 from tools.make_synthetic import make_checkpoint
 
@@ -102,6 +102,62 @@ def test_tiny_conversion(
     assert ("blk.0.attn_q.lb_v_r" in tensors) == residual
     for key in ("format_version", "residual", "eff_bits", "use_itq"):
         assert reader.get_field(f"littlebit.{key}") is not None
+
+
+@pytest.mark.parametrize(
+    "embd_arg,output_arg,embedding_type,output_type",
+    [
+        ("q4_k", None, Q.Q5_0, None),
+        ("q6_k", "q8_0", Q.Q8_0, None),
+        ("q6_k", "q4_k", Q.Q8_0, Q.Q5_0),
+    ],
+)
+def test_k_quant_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    embd_arg: str,
+    output_arg: str | None,
+    embedding_type: Q,
+    output_type: Q | None,
+) -> None:
+    torch.set_num_threads(2)
+    source, checkpoint, output = (
+        tmp_path / name for name in ("source", "lb", "model.gguf")
+    )
+    make_tiny_model(source, width=128)
+    make_checkpoint(str(source), checkpoint, 0.1, False, 0)
+    args = [
+        "convert",
+        str(checkpoint),
+        "--outfile",
+        str(output),
+        "--embd-type",
+        embd_arg,
+    ]
+    if output_arg:
+        args += ["--output-type", output_arg]
+    monkeypatch.setattr("sys.argv", args)
+    main()
+    notices = capsys.readouterr().out
+    assert (
+        f"token_embd.weight: width 128 is incompatible with {embd_arg.upper()}; using {embedding_type.name}"
+        in notices
+    )
+    types = {t.name: t.tensor_type for t in gguf.GGUFReader(output).tensors}
+    assert types["token_embd.weight"] == embedding_type
+    assert types.get("output.weight") == output_type
+    if output_type is not None:
+        assert output_arg is not None
+        assert (
+            f"output.weight: width 128 is incompatible with {output_arg.upper()}; using {output_type.name}"
+            in notices
+        )
+
+
+@pytest.mark.parametrize("requested", [Q.Q4_K, Q.Q6_K, Q.Q8_0])
+def test_unaligned_dense_width_falls_back_to_f16(requested: Q) -> None:
+    assert dense_type("output.weight", 129, requested) == Q.F16
 
 
 def test_legacy_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

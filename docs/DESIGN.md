@@ -61,15 +61,15 @@ llama.cpp is included as a git submodule pinned to a commit that has `Q1_0`; the
 
 - Reuses llama.cpp's own Python tooling (`gguf-py`, and the model classes in `convert_hf_to_gguf.py` for Llama/Qwen2/Qwen3) for the tokenizer, hyperparameters, norms and embeddings, and only takes over the compressed projections.
 - Reads the packed int32 arrays directly; unpacks to floats only for validation.
-- `--embd-type` and `--output-type` (`f16`, `q8_0`, `q6_k`, `q4_k`) for token embeddings and the output layer; handles tied embeddings.
+- `--embd-type` and `--output-type` (`f16`, `q8_0`, `q6_k`, `q4_k`) for token embeddings and the output layer. The same types as pinned `llama-quantize` are used for incompatible rows: Q4_K falls back to Q5_0, Q6_K to Q8_0, and an incompatible 32-column block falls back to F16. Tied weights share one tensor when the effective storage types match.
 - `--validate N`: for N random layers, compares the GGUF tensors' result (dequantized in numpy) with the reference float computation and prints the error.
 - Prints a summary: per-layer rank, padding, bits per weight, total file size and how much of it is embeddings.
 
 ## Testing
 
-- **Synthetic checkpoints**: a script that turns a real small Hugging Face model (SmolLM2-135M for Llama, Qwen2.5-0.5B, Qwen3-0.6B) into a format-correct LittleBit checkpoint using the paper's initialisation (truncated SVD, signs of the factors, rank-1 fits of their magnitudes for the scales, optional residual), with no training. Quality is meaningless; it exists for equivalence tests.
+- **Synthetic checkpoints**: a script that turns a real small Hugging Face model (Qwen2.5-0.5B and Qwen3-0.6B, with an aligned tiny fixture for Llama) into a format-correct LittleBit checkpoint using the paper's initialisation (truncated SVD, signs of the factors, rank-1 fits of their magnitudes for the scales, optional residual), with no training. Quality is meaningless; it exists for equivalence tests.
 - **Layer level**: converter output versus the reference float computation, exact up to fp16 scale rounding.
-- **Model level**: logits from the patched llama.cpp versus a plain PyTorch implementation of the same synthetic weights, on fixed prompts: top-1 agreement, max absolute difference and KL divergence, with tolerances justified by the activation quantization.
+- **Model level**: logits from the patched llama.cpp versus a plain PyTorch implementation of the same synthetic weights, on fixed prompts: top-1 agreement, max absolute difference and KL divergence, with tolerances checked against activation rounding and cache precision measurements.
 - **Smoke**: `llama-cli` generates text from a converted file; `llama-bench` reports speed. File sizes are recorded.
 
 ## Milestones

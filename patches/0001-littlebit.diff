@@ -1,12 +1,10 @@
 diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
-index 824601e..ef77862 100644
+index 824601e..6449e91 100644
 --- a/src/llama-adapter.cpp
 +++ b/src/llama-adapter.cpp
-@@ -329,8 +329,20 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
-             throw std::runtime_error("LoRA tensor pair for '" + name + "' is missing one component");
-         }
+@@ -331,6 +331,19 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
  
--        // device buft and device ctx
+         // device buft and device ctx
          const auto * model_tensor = model.get_tensor(name.c_str());
 +        if (model.littlebit_enabled) {
 +            const size_t suffix = name.rfind('.');
@@ -187,13 +185,13 @@ index 629b3a7..73d8248 100644
  
  std::string llama_model::arch_name() const {
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 8d2f562..6fae4a2 100644
+index 8d2f562..7175a12 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -750,6 +750,17 @@ struct llama_prec_policy {
+@@ -749,6 +749,17 @@ struct llama_prec_policy {
+     void load(llama_model_loader & ml, const llama_model & model);
  };
  
- // transform of a folded weight, applied to the matmul input: optional sign flip, then the normalized block Hadamard rotation
 +struct llama_littlebit_path {
 +    ggml_tensor * g;
 +    ggml_tensor * v;
@@ -205,9 +203,9 @@ index 8d2f562..6fae4a2 100644
 +    llama_littlebit_path residual;
 +};
 +
+ // transform of a folded weight, applied to the matmul input: optional sign flip, then the normalized block Hadamard rotation
  struct llama_hadamard_transform {
      ggml_tensor * rot;
-     ggml_tensor * signs; // nullptr for identity sign mode
 @@ -818,6 +829,10 @@ struct llama_model {
  
      llama_hadamard hdmd;

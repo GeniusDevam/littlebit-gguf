@@ -43,6 +43,19 @@ EMBEDDING = "token_embd.weight"
 OUTPUT = "output.weight"
 
 
+def dense_type(name: str, width: int, requested: Q) -> Q:
+    block, _ = gguf.GGML_QUANT_SIZES[requested]
+    if width % block == 0:
+        return requested
+    fallback = {Q.Q4_K: Q.Q5_0, Q.Q6_K: Q.Q8_0}.get(requested, Q.F16)
+    if width % gguf.GGML_QUANT_SIZES[fallback][0]:
+        fallback = Q.F16
+    print(
+        f"{name}: width {width} is incompatible with {requested.name}; using {fallback.name}"
+    )
+    return fallback
+
+
 def quantize_k(data: np.ndarray, qtype: Q, binary_dir: Path) -> np.ndarray:
     block, size = gguf.GGML_QUANT_SIZES[qtype]
     if data.shape[1] % block:
@@ -131,17 +144,21 @@ class LittleBitMixin:
         selected = set(
             np.random.default_rng(0).choice(layers, options.validate, replace=False)
         )
-        self.dense_types = {
-            EMBEDDING: TYPES[options.embd_type],
-            OUTPUT: TYPES[options.output_type],
-        }
-        if "lm_head.weight" not in self.model_tensors:
-            if not self.hparams.get("tie_word_embeddings", False):
-                raise ValueError("untied model is missing lm_head.weight")
-            if self.dense_types[EMBEDDING] != self.dense_types[OUTPUT]:
-                self.model_tensors["lm_head.weight"] = self.model_tensors[
-                    "model.embed_tokens.weight"
-                ]
+        embedding = self.model_tensors["model.embed_tokens.weight"]
+        output = self.model_tensors.get("lm_head.weight")
+        if output is None and not self.hparams.get("tie_word_embeddings", False):
+            raise ValueError("untied model is missing lm_head.weight")
+        embd_type = dense_type(
+            EMBEDDING, embedding().shape[-1], TYPES[options.embd_type]
+        )
+        out_type = embd_type
+        if output is not None or options.output_type != options.embd_type:
+            out_type = dense_type(
+                OUTPUT, (output or embedding)().shape[-1], TYPES[options.output_type]
+            )
+        self.dense_types = {EMBEDDING: embd_type, OUTPUT: out_type}
+        if output is None and embd_type != out_type:
+            self.model_tensors["lm_head.weight"] = embedding
         self.gguf_writer.add_uint32("littlebit.format_version", 1)
         self.gguf_writer.add_bool("littlebit.residual", options.residual)
         self.gguf_writer.add_float32("littlebit.eff_bits", options.eff_bit)
