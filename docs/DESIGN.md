@@ -38,7 +38,7 @@ y = ggml_mul_mat(lb_u, t)      // [out, n]
 
 This is exact up to two things: scales converted from bf16 to fp16 (the converter checks every value is in fp16 range and reports the largest relative change), and llama.cpp's usual quantization of activations inside the `Q1_0` dot product (typically to `Q8_0`). The tests measure both.
 
-**Padding.** `r_pad` is `r` rounded up to a multiple of 128. In `lb_v`, padded rows get `d = 0`, so their outputs are exactly 0. In `lb_u`, padded columns multiply those zeros, so their bits do not matter (write 0). `in` must already be a multiple of 128, which holds for Llama and Qwen models; other shapes are rejected with a clear error for now.
+**Padding.** `r_pad` is `r` rounded up to a multiple of 128. In `lb_v`, padded rows get `d = 0`, so their outputs are exactly 0. In `lb_u`, padded columns multiply those zeros (write 0). The input width must already be a multiple of 128. SmolLM2-135M has width 576 and fails this check.
 
 **Optional fusion.** The second stage of the two paths can be merged: `y = [U' | U'_R] · [V'(g ⊙ x) ; V'_R(g_R ⊙ x)]`. It saves one matmul per layer; the first stage cannot be merged because `g` and `g_R` differ. Only worth doing if the benchmarks show a gain.
 

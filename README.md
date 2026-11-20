@@ -23,7 +23,7 @@ So a LittleBit layer becomes one element-wise multiply and two ordinary `Q1_0` m
 y = U' · ( V' · ( g ⊙ x ) )          (and the same again for the residual path)
 ```
 
-No new kernels. Anything that already runs `Q1_0` runs these layers too.
+The patched graph uses ggml's existing `Q1_0` kernel and element-wise multiply.
 
 ## What it costs
 
@@ -46,13 +46,83 @@ The other half of the story is the layers LittleBit leaves alone. The reference 
 | Component | Status |
 |---|---|
 | Design and format notes | done, see [docs/DESIGN.md](docs/DESIGN.md) and [docs/FORMAT.md](docs/FORMAT.md) |
-| Converter: LittleBit checkpoint to GGUF | planned, first milestone |
-| llama.cpp patch: Llama, Qwen2, Qwen3 | planned, first milestone |
-| Correctness tests and CPU benchmarks | planned, first milestone |
+| Converter: LittleBit checkpoint to GGUF | implemented |
+| llama.cpp patch: Llama, Qwen2, Qwen3 | implemented for CPU and 128-aligned projection inputs |
+| Correctness tests and CPU benchmarks | see the test and measurement commands below |
 | More architectures (Gemma, Phi) | planned |
 | Upstream proposal to llama.cpp | planned |
 
 Until the changes are upstream, LittleBit GGUF files need the patched build from this repo. Stock llama.cpp, Ollama and LM Studio will not load them yet.
+
+## Build on Linux or WSL
+
+The llama.cpp submodule is pinned to `6aee50801d091f78b3baacd505f5e95d8e8f6838`. The build script initializes the submodule, applies the patches, and builds the CPU tools. It can be rerun on the same checkout. Use a C++ compiler, CMake, Ninja, and Python 3.12.
+
+```sh
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install 'torch>=2.6' --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt pytest ruff
+bash scripts/build.sh
+python -m pytest
+```
+
+Set `LITTLEBIT_BUILD_DIR` to an absolute path to put build output on another drive. Set `LITTLEBIT_JOBS` to change the build's two-job default. `LITTLEBIT_NATIVE=OFF` disables CPU-native tuning.
+
+## Convert and run
+
+```sh
+python convert_littlebit_to_gguf.py checkpoints/littlebit --outfile model.gguf \
+    --embd-type q8_0 --validate 5
+build/bin/llama-cli -m model.gguf -ngl 0 -t 4 -c 512 --single-turn -p 'Once upon a time' -n 32
+```
+
+The converter reads `littlebit_config.json` or the fields in `config.json`. Older checkpoints can supply `--eff-bit`, `--residual` or `--no-residual`, and `--use-itq` when needed. `--embd-type` and `--output-type` accept `f16`, `q8_0`, `q6_k`, and `q4_k`. The output defaults to the embedding type. Tied embeddings remain shared unless a different output type is requested. The K types require the compiled `libggml-base.so` and a row width divisible by 256. The 896-wide Qwen2.5-0.5B embedding supports `f16` and `q8_0`. SmolLM2-135M's 576-wide projections fail the 128-column input alignment required by this milestone.
+
+The synthetic generator applies Dual-SVID initialization to a local Hugging Face checkpoint or model ID. It supports `--residual` and `--no-residual`. Synthetic checkpoints are for arithmetic and runtime checks. Their language-model quality reflects initialization without training.
+
+The Qwen3-0.6B synthetic checkpoint at 1.0 bpw exceeds the float-reference tolerances in the slow logits test.
+
+```sh
+python tools/make_synthetic.py Qwen/Qwen3-0.6B checkpoints/qwen3-0.1 --eff-bit 0.1
+python convert_littlebit_to_gguf.py checkpoints/qwen3-0.1 --outfile checkpoints/qwen3-0.1-f16.gguf
+LITTLEBIT_TEST_DATA=checkpoints python -m pytest -m slow -s -k '0.1 and qwen3'
+```
+
+## Measured file sizes
+
+These are initialized synthetic checkpoints with residuals enabled. File sizes include metadata and tokenizer data and use decimal MB. Projection bits per weight exclude embeddings and the output head.
+
+| Model | Target bpw | GGUF projection bpw | F16 (MB) | Q8_0 (MB) | Q4_K (MB) |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 1.0 | 1.2234 | 333.27 | 205.64 | width 896 |
+| Qwen2.5-0.5B | 0.1 | 0.4865 | 300.31 | 172.69 | width 896 |
+| Qwen3-0.6B | 1.0 | 1.2042 | 383.72 | 237.87 | 160.07 |
+| Qwen3-0.6B | 0.1 | 0.4542 | 342.44 | 196.58 | 118.79 |
+
+The Qwen2.5-0.5B run at 0.1 measured 0.4865 bits per compressed weight, compared with the shape estimate of about 0.47 above. Rank padding and the F32 input scales count toward the measured figure.
+
+## CPU throughput
+
+Measured on an Intel Core i7-8550U in Ubuntu WSL2 with the pinned llama.cpp commit above. The Release build used `GGML_NATIVE=ON` with AVX2, FMA, F16C and BMI2, and OpenMP was enabled. GPU backends and BLAS were disabled. Timings are the mean and standard deviation of three runs with four CPU threads.
+
+```sh
+build/bin/llama-bench -m model.gguf -ngl 0 -t 4 -p 128 -n 32 -r 3 -o json
+```
+
+| Model | Weights | File (MB) | Prompt 128 (tok/s) | Generation 32 (tok/s) |
+|---|---|---:|---:|---:|
+| Qwen2.5-0.5B | LittleBit 0.1, F16 | 300.31 | 163.49 ± 33.15 | 26.83 ± 10.35 |
+| Qwen2.5-0.5B | LittleBit 1.0, F16 | 333.27 | 99.15 ± 16.84 | 29.03 ± 3.20 |
+| Qwen2.5-0.5B | Dense Q1_0 | 75.70 | 152.07 ± 6.52 | 77.00 ± 1.58 |
+| Qwen2.5-0.5B | Dense Q4_0 | 284.09 | 236.76 ± 13.05 | 47.56 ± 9.94 |
+| Qwen2.5-0.5B | Dense Q8_0 | 531.07 | 142.91 ± 1.43 | 20.17 ± 1.47 |
+| Qwen3-0.6B | LittleBit 0.1, F16 | 342.44 | 142.32 ± 6.13 | 28.88 ± 3.75 |
+| Qwen3-0.6B | LittleBit 0.1, Q4_K | 118.79 | 194.86 ± 12.41 | 61.34 ± 1.35 |
+| Qwen3-0.6B | LittleBit 1.0, F16 | 383.72 | 83.02 ± 7.88 | 27.73 ± 0.68 |
+| Qwen3-0.6B | Dense Q1_0 | 111.90 | 110.14 ± 8.19 | 72.16 ± 4.60 |
+| Qwen3-0.6B | Dense Q4_0 | 428.97 | 150.96 ± 16.16 | 44.43 ± 0.41 |
+| Qwen3-0.6B | Dense Q8_0 | 804.75 | 119.96 ± 5.67 | 21.52 ± 1.45 |
 
 ## Related work
 
