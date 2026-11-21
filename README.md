@@ -140,12 +140,26 @@ build/bin/llama-bench -m model.gguf -ngl 0 -t 4 -p 128 -n 32 -r 5 -o json
 
 14 of the 30 timings had a standard deviation above 10% of the mean after five repetitions. The table gives the deviation for each comparison.
 
+## Trained Qwen3-8B checkpoint
+
+These measurements use a trained LittleBit-2 checkpoint with residual paths and untied embeddings and output weights. The checkpoint is CC BY-NC 4.0. The checkpoint and converted GGUFs are kept local. [Checkpoint revision `6b2c47a`](https://huggingface.co/LittleBitLLM/littlebit-qwen3-8b-0.55bpw/tree/6b2c47aa9707e624e2e737d16d64a66be8090ae9)
+
+The tests ran on an Intel Core i7-8550U with four threads in Ubuntu WSL2 using the pinned CPU build. Perplexity uses 2,048-token windows of the WikiText-2 raw test split. Speed is the mean of five `llama-bench` repetitions at `-p 128 -n 32`.
+
+| Embedding / output | File (GB) | PPL after 4 windows | PPL after 12 windows | Prompt 128 (tok/s) | Generation 32 (tok/s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K / Q6_K | 1.457 | 26.3547 | 20.9236 | 8.47 | 5.11 |
+| F16 / F16 | 3.086 | 26.2586 | 20.8386 | 5.04 | 4.80 |
+
+The compressed projections use 0.6787 bits per dense projection weight, including both paths and the F32 input multipliers. Rank padding accounts for 56.7 MB of projection data. Conversion with `--validate 3` flushed 56 nonzero scales to zero and preserved FP16 subnormals.
+
 ## Related work
 
 - LittleBit: [arXiv:2506.13771](https://arxiv.org/abs/2506.13771). LittleBit-2: [arXiv:2603.00042](https://arxiv.org/abs/2603.00042).
 - Official training code: [SamsungLabs/LittleBit](https://github.com/SamsungLabs/LittleBit) (CC BY-NC 4.0). No code from it is used or redistributed here.
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), whose `Q1_0` type was added for PrismML's 1-bit Bonsai models.
 - Sister project: [littlebit.cpp](https://github.com/GeniusDevam/littlebit.cpp), dedicated CPU kernels for LittleBit layers.
+- [luben93/littlebit-llamacpp](https://github.com/luben93/littlebit-llamacpp) (MIT) is a parallel implementation of the same Q1_0 approach.
 
 ## License
 

@@ -6,7 +6,7 @@ import math
 import os
 import sys
 import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ ARCHITECTURES = {
 }
 EMBEDDING = "token_embd.weight"
 OUTPUT = "output.weight"
+DENSE_CHUNK_ROWS = 1024
 
 
 def dense_type(name: str, width: int, requested: Q) -> Q:
@@ -56,12 +57,7 @@ def dense_type(name: str, width: int, requested: Q) -> Q:
     return fallback
 
 
-def quantize_k(data: np.ndarray, qtype: Q, binary_dir: Path) -> np.ndarray:
-    block, size = gguf.GGML_QUANT_SIZES[qtype]
-    if data.shape[1] % block:
-        raise ValueError(
-            f"{qtype.name} requires a row width divisible by {block}; got {data.shape[1]}"
-        )
+def k_quantizer(qtype: Q, binary_dir: Path) -> Callable[..., int]:
     lib_path = binary_dir / "libggml-base.so"
     try:
         lib = ctypes.CDLL(str(lib_path))
@@ -80,21 +76,7 @@ def quantize_k(data: np.ndarray, qtype: Q, binary_dir: Path) -> np.ndarray:
         ctypes.c_void_p,
     ]
     quantize.restype = ctypes.c_size_t
-    source = np.ascontiguousarray(data, dtype=np.float32)
-    result = np.empty(
-        (source.shape[0], source.shape[1] // block * size), dtype=np.uint8
-    )
-    for offset in range(0, source.shape[0], 1024):
-        rows = source[offset : offset + 1024]
-        dest = result[offset : offset + 1024]
-        count = quantize(
-            qtype, rows.ctypes.data, dest.ctypes.data, 0, *rows.shape, None
-        )
-        if count != dest.nbytes:
-            raise ValueError(
-                f"{qtype.name} wrote {count} bytes, expected {dest.nbytes}"
-            )
-    return result
+    return quantize
 
 
 class LittleBitMixin:
@@ -115,28 +97,42 @@ class LittleBitMixin:
             }
         return super().index_tensors(remote_hf_model_id)
 
-    def tensor_force_quant(
-        self, name: str, new_name: str, bid: int | None, n_dims: int
-    ) -> Q | bool:
-        if new_name in self.dense_types:
-            return self.dense_types[new_name]
-        return super().tensor_force_quant(name, new_name, bid, n_dims)
+    def write_dense(self, name: str, tensor: torch.Tensor, qtype: Q) -> None:
+        if tensor.ndim != 2 or not all(tensor.shape):
+            raise ValueError(f"{name} must be a nonempty matrix")
+        writer = self.gguf_writer
+        spool = writer.temp_file
+        assert spool is not None
+        block, size = gguf.GGML_QUANT_SIZES[qtype]
+        height, width = tensor.shape
+        row_bytes = width // block * size
+        nbytes = height * row_bytes
+        quantize = None
+        if qtype in (Q.Q4_K, Q.Q6_K):
+            quantize = k_quantizer(qtype, self.options.binary_dir)
 
-    def modify_tensors(
-        self, data: torch.Tensor, name: str, bid: int | None
-    ) -> Iterable[tuple[str, torch.Tensor]]:
-        for mapped, tensor in super().modify_tensors(data, name, bid):
-            qtype = self.dense_types.get(mapped)
-            if qtype in (Q.Q4_K, Q.Q6_K):
-                try:
-                    quantized = quantize_k(
-                        tensor.float().numpy(), qtype, self.options.binary_dir
-                    )
-                except ValueError as exc:
-                    raise ValueError(f"{mapped}: {exc}") from exc
-                self.gguf_writer.add_tensor(mapped, quantized, raw_dtype=qtype)
+        for offset in range(0, height, DENSE_CHUNK_ROWS):
+            rows = tensor[offset : offset + DENSE_CHUNK_ROWS]
+            if qtype == Q.F16 and rows.dtype == torch.float16:
+                chunk = rows.contiguous().numpy()
+            elif quantize is None:
+                chunk = gguf.quantize(rows.float().numpy(), qtype)
             else:
-                yield mapped, tensor
+                source = rows.float().contiguous().numpy()
+                chunk = np.empty((len(rows), row_bytes), dtype=np.uint8)
+                count = quantize(
+                    qtype, source.ctypes.data, chunk.ctypes.data, 0, *source.shape, None
+                )
+                if count != chunk.nbytes:
+                    raise ValueError(
+                        f"{name}: {qtype.name} wrote {count} bytes, expected {chunk.nbytes}"
+                    )
+            if offset == 0:
+                writer.add_tensor_info(
+                    name, (height, chunk.shape[1]), chunk.dtype, nbytes, qtype
+                )
+            chunk.tofile(spool)
+        writer.write_padding(spool, nbytes)
 
     def prepare_tensors(self) -> None:
         layers = prefixes(self.block_count)
@@ -144,27 +140,19 @@ class LittleBitMixin:
         selected = set(
             np.random.default_rng(0).choice(layers, options.validate, replace=False)
         )
-        embedding = self.model_tensors["model.embed_tokens.weight"]
-        output = self.model_tensors.get("lm_head.weight")
+        # The base converter promotes whole BF16 tensors to F32.
+        embedding = self.model_tensors.pop("model.embed_tokens.weight")
+        output = self.model_tensors.pop("lm_head.weight", None)
         if output is None and not self.hparams.get("tie_word_embeddings", False):
             raise ValueError("untied model is missing lm_head.weight")
-        embd_type = dense_type(
-            EMBEDDING, embedding().shape[-1], TYPES[options.embd_type]
-        )
-        out_type = embd_type
-        if output is not None or options.output_type != options.embd_type:
-            out_type = dense_type(
-                OUTPUT, (output or embedding)().shape[-1], TYPES[options.output_type]
-            )
-        self.dense_types = {EMBEDDING: embd_type, OUTPUT: out_type}
-        if output is None and embd_type != out_type:
-            self.model_tensors["lm_head.weight"] = embedding
         self.gguf_writer.add_uint32("littlebit.format_version", 1)
         self.gguf_writer.add_bool("littlebit.residual", options.residual)
         self.gguf_writer.add_float32("littlebit.eff_bits", options.eff_bit)
         self.gguf_writer.add_bool("littlebit.use_itq", options.use_itq)
         rng = np.random.default_rng(1)
         self.compressed_bytes = self.compressed_weights = 0
+        padded_weights = flushed_count = 0
+        largest_flushed = 0.0
         max_relative = 0.0
         for prefix in layers:
             dense_name = prefix + ".weight"
@@ -211,11 +199,14 @@ class LittleBitMixin:
                         kv_heads if prefix.endswith(".k_proj") else heads,
                     ).numpy()
                 try:
-                    h, h_error = fp16_scale(factors.h)
-                    latent, l_error = fp16_scale(factors.latent)
+                    h, h_error, h_count, h_max = fp16_scale(factors.h)
+                    latent, l_error, l_count, l_max = fp16_scale(factors.latent)
                 except ValueError as exc:
                     raise ValueError(f"{prefix}: {exc}") from exc
                 max_relative = max(max_relative, h_error, l_error)
+                flushed_count += h_count + l_count
+                largest_flushed = max(largest_flushed, h_max, l_max)
+                padded_weights += (padded - rank) * (width + out)
                 v = q1_blocks(
                     factors.v, np.pad(latent, (0, padded - rank)), width, width
                 )
@@ -253,6 +244,26 @@ class LittleBitMixin:
                     f"  validation: max abs {error.max():.6g}, RMSE {np.sqrt((error**2).mean()):.6g}"
                 )
         print(f"Largest relative fp16 scale change: {max_relative:.6g}")
+        print(
+            f"Flushed {flushed_count:,} nonzero scales to fp16 zero "
+            f"(largest magnitude {largest_flushed:.6g})"
+        )
+        block, size = gguf.GGML_QUANT_SIZES[Q.Q1_0]
+        padding_bytes = padded_weights * size / block
+        print(
+            f"Rank padding: {padding_bytes:,.0f} projection bytes "
+            f"(+{padding_bytes / (self.compressed_bytes - padding_bytes):.2%} over unpadded)"
+        )
+        tensor = embedding()
+        embd_type = dense_type(EMBEDDING, tensor.shape[-1], TYPES[options.embd_type])
+        self.write_dense(EMBEDDING, tensor, embd_type)
+        if output is not None:
+            tensor = output()
+        if output is not None or options.output_type != options.embd_type:
+            out_type = dense_type(OUTPUT, tensor.shape[-1], TYPES[options.output_type])
+            if output is not None or out_type != embd_type:
+                self.write_dense(OUTPUT, tensor, out_type)
+        del tensor
         super().prepare_tensors()
 
 

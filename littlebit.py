@@ -65,7 +65,7 @@ def q1_blocks(
     return data.reshape(rows, -1)
 
 
-def fp16_scale(values: np.ndarray) -> tuple[np.ndarray, float]:
+def fp16_scale(values: np.ndarray) -> tuple[np.ndarray, float, int, float]:
     if (
         not np.isfinite(values).all()
         or (np.abs(values) > np.finfo(np.float16).max).any()
@@ -73,10 +73,14 @@ def fp16_scale(values: np.ndarray) -> tuple[np.ndarray, float]:
         raise ValueError("scale outside the finite fp16 range")
     rounded = values.astype(np.float16)
     nonzero = values != 0
-    if (rounded[nonzero] == 0).any():
-        raise ValueError("nonzero scale rounds to zero in fp16")
+    flushed = nonzero & (rounded == 0)
     error = np.abs(rounded[nonzero].astype(np.float32) / values[nonzero] - 1)
-    return rounded, float(error.max(initial=0))
+    return (
+        rounded,
+        float(error.max(initial=0)),
+        int(np.count_nonzero(flushed)),
+        float(np.abs(values[flushed]).max(initial=0)),
+    )
 
 
 @dataclass

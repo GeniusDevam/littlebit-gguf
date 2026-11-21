@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -188,12 +189,17 @@ def compare_logits(
     [(arch, bits) for arch in ("llama", "qwen2", "qwen3") for bits in (0.1, 1.0)],
 )
 def test_tiny_runtime(
-    tmp_path: Path, logits_tool: Path, architecture: str, bits: float
+    tmp_path: Path,
+    logits_tool: Path,
+    architecture: str,
+    bits: float,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, checkpoint, gguf_path = (
         tmp_path / name for name in ("source", "lb", "tiny.gguf")
     )
     torch.set_num_threads(2)
+    monkeypatch.setattr("convert_littlebit_to_gguf.DENSE_CHUNK_ROWS", 7)
     make_tiny_model(source, architecture=architecture)
     make_checkpoint(str(source), checkpoint, bits, True, 0)
     options = argparse.Namespace(
@@ -314,3 +320,66 @@ def test_published_model(model: str, bits: str, logits_tool: Path) -> None:
     assert top1 >= minimum_top1
     assert error < maximum_error
     assert kl < maximum_kl
+
+
+@pytest.mark.slow
+def test_trained_8b_perplexity(tmp_path: Path) -> None:
+    checkpoint = Path(
+        os.environ.get("LITTLEBIT_8B_CHECKPOINT", DATA / "littlebit-qwen3-8b-0.55bpw")
+    )
+    wiki = Path(os.environ.get("LITTLEBIT_WIKITEXT2", DATA / "wikitext-2-test.txt"))
+    binary_dir = BUILD / "bin"
+    perplexity = binary_dir / "llama-perplexity"
+    if not (checkpoint / "model.safetensors").is_file():
+        pytest.skip("set LITTLEBIT_8B_CHECKPOINT to the local trained checkpoint")
+    if not wiki.is_file():
+        pytest.skip("set LITTLEBIT_WIKITEXT2 to the raw WikiText-2 test text")
+    if not perplexity.is_file():
+        pytest.skip(f"build CPU tools in {BUILD} to run the perplexity test")
+
+    torch.set_num_threads(4)
+    gguf_path = tmp_path / "trained-8b.gguf"
+    convert(
+        argparse.Namespace(
+            checkpoint=checkpoint,
+            outfile=gguf_path,
+            embd_type="q4_k",
+            output_type="q6_k",
+            validate=3,
+            eff_bit=None,
+            residual=None,
+            use_itq=None,
+            binary_dir=binary_dir,
+        )
+    )
+    result = subprocess.run(
+        [
+            str(perplexity),
+            "-m",
+            str(gguf_path),
+            "-f",
+            str(wiki),
+            "-ngl",
+            "0",
+            "-t",
+            "4",
+            "-tb",
+            "4",
+            "-c",
+            "2048",
+            "-b",
+            "2048",
+            "-ub",
+            "512",
+            "--chunks",
+            "4",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+    windows = re.findall(r"\[(\d+)\](\d+\.\d+),", result.stdout)
+    assert [index for index, _ in windows] == ["1", "2", "3", "4"], result.stdout
+    assert float(windows[-1][1]) == pytest.approx(26.3547, abs=0.05), result.stdout

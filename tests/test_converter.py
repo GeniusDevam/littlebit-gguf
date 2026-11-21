@@ -3,11 +3,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from tiny_model import make_tiny_model
 
 from convert_littlebit_to_gguf import Q, dense_type, gguf, main
-from littlebit import PathFactors, fp16_scale, pack_signs, q1_blocks, unpack_signs
+from littlebit import (
+    PathFactors,
+    fp16_scale,
+    pack_signs,
+    prefixes,
+    q1_blocks,
+    unpack_signs,
+)
 from tools.make_synthetic import make_checkpoint
 
 
@@ -62,10 +69,64 @@ def test_rank_padding_and_layer_exactness() -> None:
     np.testing.assert_array_equal(actual, factors.forward(x))
 
 
-@pytest.mark.parametrize("value", [np.inf, np.nan, 65536.0, 1e-9])
+@pytest.mark.parametrize("value", [np.inf, np.nan, 65536.0])
 def test_rejects_out_of_range_scales(value: float) -> None:
     with pytest.raises(ValueError, match="fp16"):
         fp16_scale(np.array([value], dtype=np.float32))
+
+
+def test_conversion_flushes_only_scales_that_round_to_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    output = tmp_path / "model.gguf"
+    make_tiny_model(checkpoint)
+    paths = prefixes(2)
+    weights = checkpoint / "model.safetensors"
+    tensors = load_file(weights)
+    for prefix in paths:
+        rows, width = tensors.pop(f"{prefix}.weight").shape
+        rank = 8
+        factors = {
+            "U_shape": torch.tensor([rows, rank]),
+            "V_shape": torch.tensor([rank, width]),
+            "U_packed": torch.zeros((rows, 1), dtype=torch.int32),
+            "V_packed": torch.zeros((rank, width // 32), dtype=torch.int32),
+            "u1": torch.ones((1, rows), dtype=torch.bfloat16),
+            "u2": torch.ones((1, rank), dtype=torch.bfloat16),
+            "v1": torch.ones((1, rank), dtype=torch.bfloat16),
+            "v2": torch.ones((1, width), dtype=torch.bfloat16),
+        }
+        if prefix == paths[0]:
+            factors["u1"][0, :3] = torch.tensor([2**-25, 2**-24, 0])
+            factors["u2"][0, :2] = torch.tensor([-(2**-25), -(2**-23)])
+            factors["v1"][0, :2] = 0.5
+        tensors.update({f"{prefix}.{key}": value for key, value in factors.items()})
+    save_file(tensors, weights)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "convert",
+            str(checkpoint),
+            "--outfile",
+            str(output),
+            "--eff-bit",
+            "0.1",
+            "--no-residual",
+        ],
+    )
+    main()
+
+    assert (
+        "Flushed 2 nonzero scales to fp16 zero (largest magnitude 2.98023e-08)"
+        in capsys.readouterr().out
+    )
+    stored = {tensor.name: tensor for tensor in gguf.GGUFReader(output).tensors}
+    u = gguf.dequantize(stored["blk.0.attn_q.lb_u"].data, Q.Q1_0)
+    v = gguf.dequantize(stored["blk.0.attn_q.lb_v"].data, Q.Q1_0)
+    # Llama interleaves the two halves of each query head.
+    np.testing.assert_array_equal(u[[0, 2, 4], 0], [0, 2**-24, 0])
+    np.testing.assert_array_equal(v[:2, 0], [0, -(2**-24)])
 
 
 @pytest.mark.parametrize("residual", [False, True])
@@ -73,6 +134,7 @@ def test_tiny_conversion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, residual: bool
 ) -> None:
     torch.set_num_threads(2)
+    monkeypatch.setattr("convert_littlebit_to_gguf.DENSE_CHUNK_ROWS", 7)
     source = tmp_path / "source"
     checkpoint = tmp_path / "checkpoint"
     output = tmp_path / "model.gguf"
@@ -95,6 +157,11 @@ def test_tiny_conversion(
     reader = gguf.GGUFReader(output)
     tensors = {tensor.name: tensor for tensor in reader.tensors}
     assert tensors["token_embd.weight"].tensor_type == Q.Q8_0
+    embedding = load_file(checkpoint / "model.safetensors")["model.embed_tokens.weight"]
+    np.testing.assert_array_equal(
+        tensors["token_embd.weight"].data,
+        gguf.quantize(embedding.float().numpy(), Q.Q8_0),
+    )
     assert "output.weight" not in tensors
     assert "blk.0.attn_q.weight" not in tensors
     assert tensors["blk.0.attn_q.lb_v"].tensor_type == Q.Q1_0
