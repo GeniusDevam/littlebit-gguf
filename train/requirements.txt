@@ -2,3 +2,4 @@
 transformers==5.23.0
 huggingface-hub==2.4.0
 pyarrow==26.0.1
+datasets==5.1.0

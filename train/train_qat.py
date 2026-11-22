@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import ModuleType
 
 import torch
 import torch.nn.functional as F
@@ -20,16 +21,31 @@ from transformers import (
 if __package__ in ("", None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from train.data import C4_REV, MODEL, MODEL_REV, WIKI_REV, training_blocks, wikitext
+from train.data import (
+    C4_REV,
+    C4_SHARD,
+    MODEL,
+    MODEL_REV,
+    WIKI_REV,
+    token_cache,
+    tokenize_corpus,
+    training_blocks,
+)
 from train.qat_model import (
     UPSTREAM_REV,
     export_checkpoint,
     make_student,
     size_plan,
     upstream_layer,
+    upstream_recipe,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+PEAK_LR = 8e-5
+WARMUP = 0.02
+MSE_WEIGHT = 10.0
+CHECK_INTERVAL = 30 * 60
+PROGRESS_WINDOWS = 4
 
 
 def logit_kl(
@@ -43,7 +59,7 @@ def logit_kl(
     return F.kl_div(prediction, target, reduction="sum", log_target=True)
 
 
-def distillation(
+def legacy_distillation(
     student: PreTrainedModel,
     teacher: PreTrainedModel,
     ids: torch.Tensor,
@@ -89,10 +105,22 @@ def distillation(
 
 class Trainer:
     def __init__(
-        self, student: PreTrainedModel, teacher: PreTrainedModel, learning_rate: float
+        self,
+        student: PreTrainedModel,
+        teacher: PreTrainedModel,
+        learning_rate: float,
+        *,
+        recipe: ModuleType | None,
+        total_steps: int,
+        grad_accum: int,
     ) -> None:
         self.student = student.train()
         self.teacher = teacher.eval().requires_grad_(False)
+        self.student.config.use_cache = self.teacher.config.use_cache = False
+        self.recipe = recipe
+        self.learning_rate = learning_rate
+        self.total_steps = total_steps
+        self.grad_accum = grad_accum
         self.parameters = {
             name: p for name, p in student.named_parameters() if p.requires_grad
         }
@@ -103,15 +131,52 @@ class Trainer:
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.mixed_precision)
         self.step = 0
 
-    def train_step(self, ids: torch.Tensor, logit_chunk: int) -> tuple[float, float]:
+    def loss(
+        self, ids: torch.Tensor, logit_chunk: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.recipe is None:
+            kl, mse = legacy_distillation(
+                self.student, self.teacher, ids, logit_chunk, self.mixed_precision
+            )
+            return kl + mse, kl, mse
+        with torch.autocast(
+            ids.device.type,
+            dtype=torch.float16,
+            enabled=self.mixed_precision,
+            cache_enabled=False,
+        ):
+            loss, kl, mse, _ = self.recipe.kd_loss(
+                self.student,
+                self.teacher,
+                ids,
+                lam=MSE_WEIGHT,
+                mse_norm=True,
+                mse_skip=1,
+                chunk=logit_chunk,
+            )
+        return loss, kl, mse
+
+    def train_step(
+        self, batches: torch.Tensor, logit_chunk: int
+    ) -> tuple[float, float, float]:
+        if len(batches) != self.grad_accum:
+            raise ValueError("optimizer step needs one sequence per accumulation pass")
+        self.student.train()
+        if self.recipe is not None:
+            self.optim.param_groups[0]["lr"] = self.recipe.lr_at(
+                self.step, self.total_steps, self.learning_rate, WARMUP
+            )
         self.optim.zero_grad(set_to_none=True)
-        kl, mse = distillation(
-            self.student, self.teacher, ids, logit_chunk, self.mixed_precision
-        )
-        loss = kl + mse
-        if not torch.isfinite(loss).item():
-            raise FloatingPointError(f"non-finite loss at step {self.step + 1}")
-        self.scaler.scale(loss).backward()
+        total_loss = total_kl = total_mse = 0.0
+        for batch in batches.split(1):
+            ids = batch.to(device=self.student.device, dtype=torch.long)
+            loss, kl, mse = self.loss(ids, logit_chunk)
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError(f"non-finite loss at step {self.step + 1}")
+            self.scaler.scale(loss / self.grad_accum).backward()
+            total_loss += loss.item()
+            total_kl += kl.item()
+            total_mse += mse.item()
         self.scaler.unscale_(self.optim)
         torch.nn.utils.clip_grad_norm_(
             list(self.parameters.values()),
@@ -126,7 +191,12 @@ class Trainer:
                 f"Step {self.step + 1}: fp16 overflow, reduced loss scale", flush=True
             )
         self.step += 1
-        return kl.item(), mse.item()
+        self.optim.zero_grad(set_to_none=True)
+        return (
+            total_loss / self.grad_accum,
+            total_kl / self.grad_accum,
+            total_mse / self.grad_accum,
+        )
 
     def save(self, path: Path, signature: dict) -> None:
         state = {
@@ -176,7 +246,7 @@ def perplexity(
     ):
         head = model.lm_head.weight.half() if mixed_precision else model.lm_head.weight
         for offset in range(0, len(ids) - 1, seq_len - 1):
-            block = ids[offset : offset + seq_len].to(device)
+            block = ids[offset : offset + seq_len].to(device=device, dtype=torch.long)
             hidden = model.model(
                 block[:-1][None, :], use_cache=False
             ).last_hidden_state[0]
@@ -203,49 +273,73 @@ def run(args: argparse.Namespace) -> None:
     ):
         raise ValueError("use an output directory without a previous run's files")
     upstream = upstream_layer(args.upstream)
+    recipe = None if args.legacy_recipe else upstream_recipe(args.upstream)
     tokenizer_model = None
+    cache_signature = {
+        "model": MODEL_REV,
+        "datasets": [C4_REV, WIKI_REV],
+        "shard": C4_SHARD,
+        "c4_tokens": args.c4_tokens,
+        "tiny": {"seed": args.seed, "seq_len": args.seq_len} if args.tiny else None,
+    }
     if args.tiny:
         sys.path.insert(0, str(ROOT / "tests"))
         from tiny_model import make_tiny_model
 
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory(dir=output) as temp:
             source = Path(temp) / "tiny"
             make_tiny_model(source, architecture="qwen3")
             teacher = AutoModelForCausalLM.from_pretrained(source)
             tokenizer = AutoTokenizer.from_pretrained(source)
             tokenizer_model = (source / "tokenizer.model").read_bytes()
-        generator = torch.Generator().manual_seed(args.seed)
-        blocks = torch.randint(
-            0, teacher.config.vocab_size, (4, args.seq_len), generator=generator
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            MODEL, revision=MODEL_REV, token=False
         )
+
+    def corpus() -> dict[str, torch.Tensor]:
+        if not args.tiny:
+            return tokenize_corpus(tokenizer, args.c4_tokens)
+        generator = torch.Generator().manual_seed(args.seed)
+        ids = torch.randint(
+            0,
+            teacher.config.vocab_size,
+            (4, args.seq_len),
+            generator=generator,
+            dtype=torch.int32,
+        )
+        return {
+            "train": ids.flatten(),
+            "test": ids[0].clone(),
+            "c4": torch.empty(0, dtype=torch.int32),
+        }
+
+    cache_source = args.token_cache
+    if cache_source is None and args.resume is not None:
+        sibling = args.resume.with_name("tokens.pt")
+        if sibling.is_file():
+            cache_source = sibling
+    tokens = token_cache(output / "tokens.pt", cache_source, cache_signature, corpus)
+    wiki_repeat = 1 if args.legacy_recipe or args.tiny else 4
+    blocks, order = training_blocks(tokens, args.seq_len, args.seed, wiki_repeat)
+    if args.tiny:
         order = torch.arange(len(blocks))
-        test_ids = blocks[0].long()
     else:
         teacher = AutoModelForCausalLM.from_pretrained(
             MODEL, revision=MODEL_REV, token=False, dtype="auto"
         )
-        tokenizer = AutoTokenizer.from_pretrained(
-            MODEL, revision=MODEL_REV, token=False
-        )
-        blocks, order = training_blocks(
-            tokenizer, args.seq_len, args.c4_tokens, args.seed
-        )
-        test_ids = tokenizer(
-            wikitext("test"),
-            add_special_tokens=False,
-            return_tensors="pt",
-            verbose=False,
-        ).input_ids.flatten()
-
-    total_steps = args.tokens // args.seq_len
+    test_ids = tokens["test"]
+    tokens_per_step = args.seq_len * args.grad_accum
+    total_steps = args.tokens // tokens_per_step
     signature = {
-        "tiny": args.tiny,
-        "model": MODEL_REV,
-        "datasets": [C4_REV, WIKI_REV],
+        "corpus": cache_signature,
         "upstream": UPSTREAM_REV,
         "seed": args.seed,
         "seq_len": args.seq_len,
-        "c4_tokens": args.c4_tokens,
+        "wiki_repeat": wiki_repeat,
+        "grad_accum": args.grad_accum,
+        "recipe": "legacy" if args.legacy_recipe else "upstream",
+        "schedule_steps": None if args.legacy_recipe else total_steps,
         "learning_rate": args.learning_rate,
         "device_type": device.type,
         "plan": size_plan(teacher.config),
@@ -255,7 +349,15 @@ def run(args: argparse.Namespace) -> None:
     teacher.to(device)
     student = make_student(teacher, upstream, resume=args.resume is not None)
     teacher.to(dtype=torch.float32 if args.cpu else torch.float16)
-    trainer = Trainer(student, teacher, args.learning_rate)
+    student_use_cache = student.config.use_cache
+    trainer = Trainer(
+        student,
+        teacher,
+        args.learning_rate,
+        recipe=recipe,
+        total_steps=total_steps,
+        grad_accum=args.grad_accum,
+    )
     if args.resume:
         trainer.restore(args.resume, signature)
     start_step = trainer.step
@@ -265,42 +367,68 @@ def run(args: argparse.Namespace) -> None:
         )
     print(
         f"Starting at step {start_step} with {total_steps} total steps, "
-        f"setup {time.time() - started:.1f}s, device "
+        f"{tokens_per_step} tokens per step, setup {time.time() - started:.1f}s, device "
         f"{'CPU' if args.cpu else torch.cuda.get_device_name(device)}",
         flush=True,
     )
 
+    progress_ids = test_ids[: 1 + PROGRESS_WINDOWS * (args.seq_len - 1)]
+    progress_windows = math.ceil((len(progress_ids) - 1) / (args.seq_len - 1))
+
+    def check_progress() -> None:
+        print(
+            json.dumps(
+                {
+                    "step": trainer.step,
+                    "tokens": trainer.step * tokens_per_step,
+                    "progress_windows": progress_windows,
+                    "student_progress_perplexity": perplexity(
+                        student, progress_ids, args.seq_len, args.logit_chunk
+                    ),
+                }
+            ),
+            flush=True,
+        )
+
+    if trainer.step < total_steps and time.time() < deadline:
+        check_progress()
     train_start = time.monotonic()
-    next_save = train_start + 30 * 60
+    next_check = train_start + CHECK_INTERVAL
     last_step_seconds = 0.0
     latest: dict = {}
     while trainer.step < total_steps and time.time() + last_step_seconds < deadline:
         step_start = time.monotonic()
-        index = order[trainer.step % len(order)]
-        ids = blocks[index][None, :].to(device=device, dtype=torch.long)
-        kl, mse = trainer.train_step(ids, args.logit_chunk)
+        start = trainer.step * args.grad_accum
+        positions = torch.arange(start, start + args.grad_accum) % len(order)
+        loss, kl, mse = trainer.train_step(blocks[order[positions]], args.logit_chunk)
         last_step_seconds = time.monotonic() - step_start
         elapsed = time.monotonic() - train_start
-        rate = (trainer.step - start_step) * args.seq_len / elapsed
+        rate = (trainer.step - start_step) * tokens_per_step / elapsed
         latest = {
             "step": trainer.step,
-            "tokens": trainer.step * args.seq_len,
-            "loss": kl + mse,
+            "tokens": trainer.step * tokens_per_step,
+            "loss": loss,
             "kl": kl,
             "mse": mse,
+            "learning_rate": trainer.optim.param_groups[0]["lr"],
             "tokens_per_second": rate,
             "token_budget_eta_seconds": (total_steps - trainer.step)
-            * args.seq_len
+            * tokens_per_step
             / rate,
         }
-        if trainer.step == start_step + 1 or trainer.step % args.log_every == 0:
+        if (
+            trainer.step in (start_step + 1, total_steps)
+            or trainer.step % args.log_every == 0
+        ):
             print(json.dumps(latest), flush=True)
-        if time.monotonic() >= next_save:
+        if time.monotonic() >= next_check:
             trainer.save(output / "resume.pt", signature)
             print(f"Saved resume.pt at step {trainer.step}", flush=True)
-            next_save = time.monotonic() + 30 * 60
+            check_progress()
+            next_check += CHECK_INTERVAL
 
     trainer.save(output / "resume.pt", signature)
+    student.config.use_cache = student_use_cache
     export = export_checkpoint(
         student, tokenizer, output / "littlebit", tokenizer_model=tokenizer_model
     )
@@ -310,7 +438,10 @@ def run(args: argparse.Namespace) -> None:
         ).strip(),
         "initial_step": start_step,
         "final_step": trainer.step,
-        "training_tokens": trainer.step * args.seq_len,
+        "training_tokens": trainer.step * tokens_per_step,
+        "tokens_per_step": tokens_per_step,
+        "recipe": signature["recipe"],
+        "schedule_steps": signature["schedule_steps"],
         "stop": "token budget" if trainer.step == total_steps else "time budget",
         "data": "tiny random fixture" if args.tiny else "WikiText-2 test",
         "last_step": latest,
@@ -342,16 +473,17 @@ def main() -> None:
         "--upstream", type=Path, default=Path("/tmp/littlebit-upstream")
     )
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--tokens", type=int, default=2_097_152)
+    parser.add_argument("--token-cache", type=Path)
+    parser.add_argument("--legacy-recipe", action="store_true")
+    parser.add_argument("--tokens", type=int, help="cumulative input token target")
+    parser.add_argument("--grad-accum", type=int)
     parser.add_argument("--minutes", type=float, default=630.0)
     parser.add_argument("--session-start", type=float)
     parser.add_argument("--seq-len", type=int, default=2048)
-    parser.add_argument(
-        "--c4-tokens", type=int, default=8_388_608, help="0 uses the entire shard"
-    )
+    parser.add_argument("--c4-tokens", type=int, help="0 uses the entire shard")
     parser.add_argument("--logit-chunk", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=3e-5)
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--cpu", action="store_true")
@@ -368,10 +500,21 @@ def main() -> None:
         config = AutoConfig.from_pretrained(MODEL, revision=MODEL_REV, token=False)
         print(json.dumps(size_plan(config), indent=2))
         return
+    defaults = {
+        "tokens": 2_097_152 if args.legacy_recipe else 100_000_000,
+        "grad_accum": 1 if args.legacy_recipe else 2,
+        "c4_tokens": 8_388_608 if args.legacy_recipe else 0,
+        "learning_rate": 3e-5 if args.legacy_recipe else PEAK_LR,
+        "seed": 7 if args.legacy_recipe else 0,
+    }
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
     if not 2 <= args.seq_len <= (256 if args.tiny else 40960):
         parser.error("sequence length is outside the model's supported range")
     if (
-        args.tokens < args.seq_len
+        args.grad_accum < 1
+        or args.tokens < args.seq_len * args.grad_accum
         or not 0 < args.minutes <= 660
         or args.c4_tokens < 0
         or min(args.threads, args.logit_chunk, args.log_every) < 1

@@ -2,6 +2,7 @@ import copy
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import ModuleType
@@ -46,14 +47,32 @@ def upstream_layer(directory: Path) -> ModuleType:
         ["git", "-C", directory, "status", "--porcelain", "--untracked-files=no"]
     ):
         raise ValueError(f"expected a clean upstream checkout at {UPSTREAM_REV}")
-    spec = importlib.util.spec_from_file_location(
+    return load_upstream_module(
         "littlebit_upstream_layer", directory / "littlebit" / "layer.py"
     )
+
+
+def load_upstream_module(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load LittleBit layers from {directory}")
+        raise ImportError(f"cannot load LittleBit source from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def upstream_recipe(directory: Path) -> ModuleType:
+    # The pinned trainer imports its littlebit package under our converter module's name.
+    local_module = sys.modules.pop("littlebit")
+    sys.path.insert(0, str(directory.resolve()))
+    try:
+        return load_upstream_module("littlebit_upstream_train", directory / "train.py")
+    finally:
+        for name in tuple(sys.modules):
+            if name == "littlebit" or name.startswith("littlebit."):
+                del sys.modules[name]
+        sys.modules["littlebit"] = local_module
+        sys.path.pop(0)
 
 
 def rank_for_shape(width: int, out: int) -> int:
