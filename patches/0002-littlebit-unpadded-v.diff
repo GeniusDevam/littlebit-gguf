@@ -1,0 +1,96 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0057f7d..4eac1d3 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1815,7 +1815,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+             auto apply_path = [&](const llama_littlebit_path & path) {
+                 auto * scaled = ggml_mul(ctx0, cur, path.g);
+                 auto * latent = ggml_mul_mat(ctx0, path.v, scaled);
+-                auto * out    = ggml_mul_mat(ctx0, path.u, latent);
++                // an unpadded V gives r latent values, U reads r_pad
++                auto * padded = latent;
++                if (latent->ne[0] < path.u->ne[0]) {
++                    padded = ggml_pad(ctx0, latent, path.u->ne[0] - latent->ne[0], 0, 0, 0);
++                }
++                auto * out = ggml_mul_mat(ctx0, path.u, padded);
+                 prec_policy.apply(latent);
+                 prec_policy.apply(out);
+                 return out;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 73d8248..b3c8387 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -28,6 +28,7 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cfloat>
++#include <cinttypes>
+ #include <cstdint>
+ #include <cstring>
+ #include <cmath>
+@@ -1502,8 +1503,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+ 
+     uint32_t littlebit_version = 0;
+     if (ml.get_key(LLM_KV_LITTLEBIT_FORMAT_VERSION, littlebit_version, false)) {
+-        if (littlebit_version != 1) {
+-            throw std::runtime_error("unsupported LittleBit format version");
++        if (littlebit_version != 1 && littlebit_version != 2) {
++            throw std::runtime_error(
++                format("unsupported LittleBit format version %u (supported: 1, 2)", littlebit_version));
+         }
+         if (arch != LLM_ARCH_LLAMA && arch != LLM_ARCH_QWEN2 && arch != LLM_ARCH_QWEN3) {
+             throw std::runtime_error("LittleBit is supported for Llama, Qwen2 and Qwen3");
+@@ -2572,17 +2574,32 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+     }
+ 
+     auto         primary_v = this->tn(tn.tensor, "lb_v", tn.bid);
+-    const auto * meta      = ml.get_tensor_meta(primary_v.str().c_str());
+-    if (!meta) {
++    auto         primary_u = this->tn(tn.tensor, "lb_u", tn.bid);
++    const auto * meta_v    = ml.get_tensor_meta(primary_v.str().c_str());
++    if (!meta_v) {
+         return load(tn, ne, flags);
+     }
+-    const int64_t width = *ne.begin();
+-    const int64_t out   = *(ne.begin() + 1);
+-    const int64_t rank  = meta->ne[1];
+-    const int64_t block = ggml_blck_size(GGML_TYPE_Q1_0);
+-    if (rank <= 0 || rank % block != 0 || width % block != 0 || ml.get_tensor_meta(tn.str().c_str())) {
++    const auto * meta_u = ml.get_tensor_meta(primary_u.str().c_str());
++    if (!meta_u) {
++        throw std::runtime_error("missing or invalid LittleBit tensor: " + primary_u.str());
++    }
++    if (ml.get_tensor_meta(tn.str().c_str())) {
+         throw std::runtime_error("invalid LittleBit projection: " + tn.str());
+     }
++    const int64_t width    = *ne.begin();
++    const int64_t out      = *(ne.begin() + 1);
++    const int64_t rank     = meta_v->ne[1];
++    const int64_t block    = ggml_blck_size(GGML_TYPE_Q1_0);
++    const int64_t rank_pad = meta_u->ne[0];
++    if (width % block != 0) {
++        throw std::runtime_error(format("invalid LittleBit tensor %s: width %" PRId64 " is not a multiple of %" PRId64,
++                                        primary_v.str().c_str(), width, block));
++    }
++    if (rank < 1 || rank_pad != (rank + block - 1) / block * block) {
++        throw std::runtime_error(format("invalid LittleBit tensor %s: rank %" PRId64 " in %s, padded rank %" PRId64
++                                        " is not rank rounded up to a multiple of %" PRId64,
++                                        primary_u.str().c_str(), rank, primary_v.str().c_str(), rank_pad, block));
++    }
+ 
+     auto load_factor = [&](const char * suffix, ggml_type type, const std::initializer_list<int64_t> & shape) {
+         auto         factor      = this->tn(tn.tensor, suffix, tn.bid);
+@@ -2595,11 +2612,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
+     llama_littlebit_projection factors = {};
+     factors.primary.g                  = load_factor("lb_g", GGML_TYPE_F32, { width });
+     factors.primary.v                  = load_factor("lb_v", GGML_TYPE_Q1_0, { width, rank });
+-    factors.primary.u                  = load_factor("lb_u", GGML_TYPE_Q1_0, { rank, out });
++    factors.primary.u                  = load_factor("lb_u", GGML_TYPE_Q1_0, { rank_pad, out });
+     if (littlebit_residual) {
+         factors.residual.g = load_factor("lb_g_r", GGML_TYPE_F32, { width });
+         factors.residual.v = load_factor("lb_v_r", GGML_TYPE_Q1_0, { width, rank });
+-        factors.residual.u = load_factor("lb_u_r", GGML_TYPE_Q1_0, { rank, out });
++        factors.residual.u = load_factor("lb_u_r", GGML_TYPE_Q1_0, { rank_pad, out });
+     }
+ 
+     // Use U to identify the projection in the graph.
