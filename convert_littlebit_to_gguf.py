@@ -134,6 +134,25 @@ class LittleBitMixin:
             chunk.tofile(spool)
         writer.write_padding(spool, nbytes)
 
+    def prepare_metadata(self, vocab_only: bool) -> None:
+        # The base class counts the packed factors, not the weights they replace.
+        total, shared, experts, expert_count = (
+            self.gguf_writer.get_total_parameter_count()
+        )
+        delta = self.dense_params - self.factor_params
+        label = gguf.size_label(total + delta, shared + delta, experts, expert_count)
+        family = self.hparams["model_type"].capitalize()
+        name = (
+            getattr(self.options, "model_name", None) or f"LittleBit {family} {label}"
+        )
+        override = self.fname_out.parent / "metadata.json"
+        override.write_text(
+            json.dumps({"general.name": name, "general.size_label": label}),
+            encoding="utf-8",
+        )
+        self.metadata_override = override
+        super().prepare_metadata(vocab_only)
+
     def prepare_tensors(self) -> None:
         layers = prefixes(self.block_count)
         options = self.options
@@ -145,12 +164,12 @@ class LittleBitMixin:
         output = self.model_tensors.pop("lm_head.weight", None)
         if output is None and not self.hparams.get("tie_word_embeddings", False):
             raise ValueError("untied model is missing lm_head.weight")
-        self.gguf_writer.add_uint32("littlebit.format_version", 1)
-        self.gguf_writer.add_bool("littlebit.residual", options.residual)
-        self.gguf_writer.add_float32("littlebit.eff_bits", options.eff_bit)
-        self.gguf_writer.add_bool("littlebit.use_itq", options.use_itq)
+        unpadded_v = getattr(options, "unpadded_v", False)
         rng = np.random.default_rng(1)
         self.compressed_bytes = self.compressed_weights = 0
+        # Elements the base class counts for the factors, and the dense weights they replace.
+        self.factor_params = self.dense_params = 0
+        needs_v2 = False
         padded_weights = flushed_count = 0
         largest_flushed = 0.0
         max_relative = 0.0
@@ -206,10 +225,10 @@ class LittleBitMixin:
                 max_relative = max(max_relative, h_error, l_error)
                 flushed_count += h_count + l_count
                 largest_flushed = max(largest_flushed, h_max, l_max)
-                padded_weights += (padded - rank) * (width + out)
-                v = q1_blocks(
-                    factors.v, np.pad(latent, (0, padded - rank)), width, width
-                )
+                needs_v2 |= unpadded_v and padded != rank
+                padded_weights += (padded - rank) * (out if unpadded_v else width + out)
+                v_scales = latent if unpadded_v else np.pad(latent, (0, padded - rank))
+                v = q1_blocks(factors.v, v_scales, width, width)
                 u = q1_blocks(
                     factors.u if order is None else factors.u[order],
                     h if order is None else h[order],
@@ -221,17 +240,20 @@ class LittleBitMixin:
                 self.gguf_writer.add_tensor(f"{base}.lb_v{suffix}", v, raw_dtype=Q.Q1_0)
                 self.gguf_writer.add_tensor(f"{base}.lb_u{suffix}", u, raw_dtype=Q.Q1_0)
                 used_bytes += factors.g.nbytes + v.nbytes + u.nbytes
+                self.factor_params += width + len(v) * width + len(u) * padded
                 if prefix in selected:
                     if not residual:
                         x = rng.standard_normal((4, width), dtype=np.float32)
                     expected = factors.forward(x)
                     reference += expected if order is None else expected[:, order]
                     first = (x * factors.g) @ gguf.dequantize(v, Q.Q1_0).T
+                    first = np.pad(first, ((0, 0), (0, padded - first.shape[1])))
                     actual += first @ gguf.dequantize(u, Q.Q1_0).T
             for name in ("_eff_bit_target", "_split_dim_final", "_eff_bit_actual"):
                 self.model_tensors.pop(f"{prefix}.{name}", None)
             self.compressed_bytes += used_bytes
             self.compressed_weights += width * out
+            self.dense_params += width * out
             padding = (
                 " (over half the padded rank is unused)" if rank * 2 < padded else ""
             )
@@ -254,6 +276,11 @@ class LittleBitMixin:
             f"Rank padding: {padding_bytes:,.0f} projection bytes "
             f"(+{padding_bytes / (self.compressed_bytes - padding_bytes):.2%} over unpadded)"
         )
+        # Padded and unpadded files are the same bytes when every rank is a multiple of 128.
+        self.gguf_writer.add_uint32("littlebit.format_version", 2 if needs_v2 else 1)
+        self.gguf_writer.add_bool("littlebit.residual", options.residual)
+        self.gguf_writer.add_float32("littlebit.eff_bits", options.eff_bit)
+        self.gguf_writer.add_bool("littlebit.use_itq", options.use_itq)
         tensor = embedding()
         embd_type = dense_type(EMBEDDING, tensor.shape[-1], TYPES[options.embd_type])
         self.write_dense(EMBEDDING, tensor, embd_type)
@@ -349,6 +376,12 @@ def main() -> None:
     parser.add_argument("--eff-bit", type=float)
     parser.add_argument("--residual", action=argparse.BooleanOptionalAction)
     parser.add_argument("--use-itq", action=argparse.BooleanOptionalAction)
+    parser.add_argument(
+        "--unpadded-v",
+        action="store_true",
+        help="store lb_v at the true rank (format version 2)",
+    )
+    parser.add_argument("--model-name", help="general.name in the GGUF")
     parser.add_argument(
         "--binary-dir",
         type=Path,
