@@ -1,10 +1,12 @@
+import hashlib
+import re
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
-from tiny_model import make_tiny_model
+from tiny_model import make_tiny_littlebit, make_tiny_model
 
 from convert_littlebit_to_gguf import Q, dense_type, gguf, main
 from littlebit import (
@@ -275,3 +277,123 @@ def test_rejects_unaligned_width(
     assert exc.value.code == 1
     assert "input width 192 is not a multiple of 128" in capsys.readouterr().err
     assert not output.exists()
+
+
+MIXED_RANKS = (33, 128, 200, 256, 8, 64, 130)
+
+
+def tensor_digest(path: Path) -> str:
+    # The embedding shape depends on the tokenizer trained for the tiny model, so leave it out.
+    digest = hashlib.sha256()
+    for tensor in gguf.GGUFReader(path).tensors:
+        if tensor.name != "token_embd.weight":
+            label = f"{tensor.name} {tensor.tensor_type.name} {list(tensor.shape)}"
+            digest.update(label.encode() + tensor.data.tobytes())
+    return digest.hexdigest()
+
+
+def convert_tiny(
+    checkpoint: Path, output: Path, *flags: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = ["convert", str(checkpoint), "--outfile", str(output), "--validate", "14"]
+    monkeypatch.setattr("sys.argv", [*args, *flags])
+    main()
+
+
+def test_unpadded_v_changes_only_v_and_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    torch.set_num_threads(2)
+    checkpoint = tmp_path / "checkpoint"
+    make_tiny_littlebit(checkpoint, MIXED_RANKS)
+    padded, unpadded = tmp_path / "padded.gguf", tmp_path / "unpadded.gguf"
+    convert_tiny(checkpoint, padded, monkeypatch=monkeypatch)
+    convert_tiny(checkpoint, unpadded, "--unpadded-v", monkeypatch=monkeypatch)
+    errors = re.findall(r"max abs ([\d.e+-]+)", capsys.readouterr().out)
+    assert len(errors) == 28 and max(map(float, errors)) < 1e-3
+
+    old, new = gguf.GGUFReader(padded), gguf.GGUFReader(unpadded)
+    assert old.get_field("littlebit.format_version").contents() == 1
+    assert new.get_field("littlebit.format_version").contents() == 2
+    assert [t.name for t in old.tensors] == [t.name for t in new.tensors]
+    ranks = set()
+    for before, after in zip(old.tensors, new.tensors, strict=True):
+        if not before.name.endswith(("lb_v", "lb_v_r")):
+            assert before.data.tobytes() == after.data.tobytes(), before.name
+            continue
+        rank = int(after.shape[1])
+        ranks.add(rank)
+        assert int(before.shape[1]) == -(-rank // 128) * 128
+        assert before.data.tobytes().startswith(after.data.tobytes())
+    assert ranks == set(MIXED_RANKS)
+    changed = {"GGUF.version", "littlebit.format_version"}
+    assert old.fields.keys() == new.fields.keys()
+    for key in old.fields.keys() - changed:
+        assert old.get_field(key).contents() == new.get_field(key).contents(), key
+
+
+def test_aligned_ranks_write_the_same_file_in_both_layouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.set_num_threads(2)
+    checkpoint = tmp_path / "checkpoint"
+    make_tiny_littlebit(checkpoint, (128, 256))
+    padded, unpadded = tmp_path / "padded.gguf", tmp_path / "unpadded.gguf"
+    convert_tiny(checkpoint, padded, monkeypatch=monkeypatch)
+    convert_tiny(checkpoint, unpadded, "--unpadded-v", monkeypatch=monkeypatch)
+    assert padded.read_bytes() == unpadded.read_bytes()
+    reader = gguf.GGUFReader(unpadded)
+    assert reader.get_field("littlebit.format_version").contents() == 1
+
+
+# Digest of every tensor name, type, shape and byte, taken from the converter before format version 2.
+DEFAULT_OUTPUT_DIGEST = (
+    "3177fe961fd47365943c531fff124709282ce82b84f0dfbe4f4d058b54b7aa5b"
+)
+DEFAULT_KEYS = (
+    "GGUF.version GGUF.tensor_count GGUF.kv_count general.architecture "
+    "littlebit.format_version littlebit.residual littlebit.eff_bits littlebit.use_itq "
+    "general.type general.name general.size_label llama.block_count "
+    "llama.context_length llama.embedding_length llama.feed_forward_length "
+    "llama.attention.head_count llama.attention.head_count_kv llama.rope.freq_base "
+    "llama.attention.layer_norm_rms_epsilon llama.attention.key_length "
+    "llama.attention.value_length general.file_type llama.vocab_size "
+    "llama.rope.dimension_count general.quantization_version tokenizer.ggml.model "
+    "tokenizer.ggml.pre tokenizer.ggml.tokens tokenizer.ggml.scores "
+    "tokenizer.ggml.token_type tokenizer.ggml.bos_token_id tokenizer.ggml.eos_token_id"
+).split()
+
+
+def test_default_output_matches_previous_converter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    torch.set_num_threads(2)
+    checkpoint, output = tmp_path / "checkpoint", tmp_path / "model.gguf"
+    make_tiny_littlebit(checkpoint, MIXED_RANKS)
+    convert_tiny(checkpoint, output, monkeypatch=monkeypatch)
+    assert tensor_digest(output) == DEFAULT_OUTPUT_DIGEST
+    reader = gguf.GGUFReader(output)
+    assert list(reader.fields) == DEFAULT_KEYS
+    assert reader.get_field("littlebit.format_version").contents() == 1
+
+    # The name and size label describe the dense model, not the directory and the packed factors.
+    state = load_file(checkpoint / "model.safetensors")
+    layers = tuple(f"{p}." for p in prefixes(2))
+    dense = sum(v.numel() for n, v in state.items() if not n.startswith(layers))
+    dense += sum(
+        state[f"{p}.U_shape"][0] * state[f"{p}.V_shape"][1] for p in prefixes(2)
+    )
+    assert reader.get_field("general.size_label").contents() == gguf.size_label(
+        int(dense), int(dense), 0, 0
+    )
+    assert reader.get_field("general.name").contents().startswith("LittleBit Llama ")
+
+
+def test_model_name_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    torch.set_num_threads(2)
+    checkpoint, output = tmp_path / "checkpoint", tmp_path / "model.gguf"
+    make_tiny_littlebit(checkpoint, (128,))
+    convert_tiny(
+        checkpoint, output, "--model-name", "Tiny test", monkeypatch=monkeypatch
+    )
+    assert gguf.GGUFReader(output).get_field("general.name").contents() == "Tiny test"

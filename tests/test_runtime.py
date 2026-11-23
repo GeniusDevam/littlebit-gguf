@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from tiny_model import make_tiny_model
+from tiny_model import make_tiny_littlebit, make_tiny_model
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from convert_littlebit_to_gguf import LLAMA, ROOT, convert, gguf
@@ -383,3 +384,97 @@ def test_trained_8b_perplexity(tmp_path: Path) -> None:
     windows = re.findall(r"\[(\d+)\](\d+\.\d+),", result.stdout)
     assert [index for index, _ in windows] == ["1", "2", "3", "4"], result.stdout
     assert float(windows[-1][1]) == pytest.approx(26.3547, abs=0.05), result.stdout
+
+
+def convert_layouts(tmp_path: Path, ranks: tuple[int, ...]) -> tuple[Path, Path, Path]:
+    checkpoint = tmp_path / "lb"
+    make_tiny_littlebit(checkpoint, ranks)
+    files = []
+    for name, unpadded_v in (("padded", False), ("unpadded", True)):
+        files.append(tmp_path / f"{name}.gguf")
+        convert(
+            argparse.Namespace(
+                checkpoint=checkpoint,
+                outfile=files[-1],
+                embd_type="f16",
+                output_type=None,
+                validate=0,
+                eff_bit=None,
+                residual=None,
+                use_itq=None,
+                binary_dir=BUILD / "bin",
+                unpadded_v=unpadded_v,
+            )
+        )
+    return checkpoint, files[0], files[1]
+
+
+def load_error(tool: Path, model: Path) -> str:
+    result = subprocess.run(
+        [str(tool), str(model), "1", "f16", "1"], capture_output=True, check=False
+    )
+    assert result.returncode != 0
+    return result.stderr.decode(errors="replace")
+
+
+def test_unpadded_layout_gives_the_same_logits(
+    tmp_path: Path, logits_tool: Path
+) -> None:
+    torch.set_num_threads(2)
+    checkpoint, padded, unpadded = convert_layouts(
+        tmp_path, (33, 128, 200, 256, 8, 64, 130)
+    )
+    assert padded.stat().st_size > unpadded.stat().st_size
+    token_ids = prompt_ids(checkpoint)
+    expected = reference_logits(checkpoint, token_ids, 2)
+    for ids, ref in zip(token_ids, expected, strict=True):
+        old, new = (
+            logits(logits_tool, path, ids, 2, "f16") for path in (padded, unpadded)
+        )
+        assert torch.isfinite(new).all() and new.std() > 0
+        assert torch.equal(old, new)
+        assert (new - ref).abs().max() < 0.1
+
+
+def edit_gguf(path: Path, edit: Callable[[gguf.GGUFReader], None]) -> None:
+    reader = gguf.GGUFReader(path, "r+")
+    edit(reader)
+    reader.data.flush()
+    del reader
+
+
+def test_loader_refuses_other_format_versions(
+    tmp_path: Path, logits_tool: Path
+) -> None:
+    torch.set_num_threads(2)
+    _, padded, unpadded = convert_layouts(tmp_path, (33, 128))
+
+    def set_version(reader: gguf.GGUFReader) -> None:
+        reader.get_field("littlebit.format_version").parts[-1][0] = 3
+
+    for path in (padded, unpadded):
+        edit_gguf(path, set_version)
+        assert "unsupported LittleBit format version 3" in load_error(logits_tool, path)
+
+
+@pytest.mark.parametrize(
+    "tensor,dims,message",
+    [
+        # Each new shape keeps the byte size, so the file stays well formed.
+        ("blk.0.attn_k.lb_u", [128, 256], "invalid LittleBit tensor blk.0.attn_k.lb_u"),
+        ("blk.0.attn_q.lb_u", [256, 128], "invalid LittleBit tensor blk.0.attn_q.lb_u"),
+        ("blk.0.attn_q.lb_v", [128, 66], "blk.0.attn_q.lb_v"),
+    ],
+)
+def test_loader_refuses_malformed_shapes(
+    tmp_path: Path, logits_tool: Path, tensor: str, dims: list[int], message: str
+) -> None:
+    torch.set_num_threads(2)
+    _, _, unpadded = convert_layouts(tmp_path, (33, 130))
+
+    def edit(reader: gguf.GGUFReader) -> None:
+        field = next(t for t in reader.tensors if t.name == tensor).field
+        field.parts[3][:] = dims
+
+    edit_gguf(unpadded, edit)
+    assert message in load_error(logits_tool, unpadded)
