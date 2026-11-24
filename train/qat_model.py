@@ -127,6 +127,16 @@ def make_student(
     return student
 
 
+def trainable_elements(config: Qwen3Config) -> int:
+    """Count the latent factors and scales that receive gradients."""
+    plan = size_plan(config)
+    per_layer = sum(
+        2 * (row["rank"] * (row["in"] + row["out"] + 1) + row["in"] + row["out"])
+        for row in plan["per_layer"].values()
+    )
+    return plan["layers"] * per_layer
+
+
 def size_plan(config: Qwen3Config) -> dict:
     width = config.hidden_size
     query = config.head_dim * config.num_attention_heads
