@@ -69,7 +69,7 @@ The teacher scores 20.96. The 100M target is 24,414 steps, so 10,575 steps (43,3
 
 | Remaining 43.3M tokens | Rate | Training hours |
 | --- | ---: | ---: |
-| One T4, measured rate of session 2 | 754 tokens/s | 15.96 |
+| One T4, measured rate of session 2 | 754 tokens/s | 15.95 |
 | Both T4s at 1.6 times that rate (**estimate**) | 1,207 tokens/s | 9.97 |
 | Both T4s at 1.9 times that rate (**estimate**) | 1,433 tokens/s | 8.40 |
 
