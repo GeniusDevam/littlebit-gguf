@@ -1,0 +1,16 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b3c8387..1cd8d87 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1510,6 +1510,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+         if (arch != LLM_ARCH_LLAMA && arch != LLM_ARCH_QWEN2 && arch != LLM_ARCH_QWEN3) {
+             throw std::runtime_error("LittleBit is supported for Llama, Qwen2 and Qwen3");
+         }
++        for (const auto & weight : ml.weights_map) {
++            if (weight.first.find("_exps.lb_") != std::string::npos) {
++                throw std::runtime_error("LittleBit expert tensors are not supported: " + weight.first);
++            }
++        }
+         float eff_bits = 0;
+         bool  use_itq  = false;
+         ml.get_key(LLM_KV_LITTLEBIT_RESIDUAL, littlebit_residual);

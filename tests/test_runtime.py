@@ -478,3 +478,53 @@ def test_loader_refuses_malformed_shapes(
 
     edit_gguf(unpadded, edit)
     assert message in load_error(logits_tool, unpadded)
+
+
+def make_expert_gguf(source: Path, output: Path) -> None:
+    """Copy a tiny file but give every block LittleBit expert tensors instead of dense FFN factors."""
+    reader = gguf.GGUFReader(source)
+    writer = gguf.GGUFWriter(output, "llama")
+    for field in reader.fields.values():
+        if field.name == "general.architecture" or field.name.startswith("GGUF."):
+            continue
+        kind = field.types[0]
+        sub = field.types[-1] if kind == gguf.GGUFValueType.ARRAY else None
+        writer.add_key_value(field.name, field.contents(), kind, sub_type=sub)
+    writer.add_expert_count(2)
+    writer.add_expert_used_count(1)
+    ffn = ("ffn_gate", "ffn_up", "ffn_down")
+    for tensor in reader.tensors:
+        if not any(f"{name}.lb_" in tensor.name for name in ffn):
+            writer.add_tensor(tensor.name, tensor.data, raw_dtype=tensor.tensor_type)
+    q1_row = 18  # one 128-weight Q1_0 block
+    for block in range(2):
+        writer.add_tensor(
+            f"blk.{block}.ffn_gate_inp.weight", np.zeros((2, 256), dtype=np.float32)
+        )
+        for name in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"):
+            base = f"blk.{block}.{name}"
+            writer.add_tensor(f"{base}.lb_g", np.ones((2, 256), dtype=np.float32))
+            writer.add_tensor(
+                f"{base}.lb_v",
+                np.zeros((2, 128, 2 * q1_row), dtype=np.uint8),
+                raw_dtype=gguf.GGMLQuantizationType.Q1_0,
+            )
+            writer.add_tensor(
+                f"{base}.lb_u",
+                np.zeros((2, 256, q1_row), dtype=np.uint8),
+                raw_dtype=gguf.GGMLQuantizationType.Q1_0,
+            )
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def test_loader_refuses_expert_tensors(tmp_path: Path, logits_tool: Path) -> None:
+    torch.set_num_threads(2)
+    _, padded, _ = convert_layouts(tmp_path, (33, 128))
+    experts = tmp_path / "experts.gguf"
+    make_expert_gguf(padded, experts)
+    error = load_error(logits_tool, experts)
+    message = "LittleBit expert tensors are not supported: blk.0.ffn_"
+    assert message in error and "_exps.lb_" in error
