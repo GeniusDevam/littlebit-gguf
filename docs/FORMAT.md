@@ -75,7 +75,7 @@ Embeddings and `lm_head` are not included in that figure, and in small models th
 
 # GGUF layout
 
-How a LittleBit model is stored in a GGUF file for llama.cpp. Format versions 1 and 2 exist. The loader in this repository reads both. The converter writes version 1 by default and version 2 with `--unpadded-v`. Two other implementations, [luben93/littlebit-llamacpp](https://github.com/luben93/littlebit-llamacpp) and [ScarionWorkspace/littlebit-gguf](https://github.com/ScarionWorkspace/littlebit-gguf), agreed this layout in [issue 1](https://github.com/GeniusDevam/littlebit-gguf/issues/1).
+How a LittleBit model is stored in a GGUF file for llama.cpp. Format versions 1 and 2 exist. The loader in this repository reads both. The converter writes version 1 by default and version 2 with `--unpadded-v`. Two other implementations, [luben93/littlebit-llamacpp](https://github.com/luben93/littlebit-llamacpp) and [ScarionWorkspace/littlebit-gguf](https://github.com/ScarionWorkspace/littlebit-gguf), agreed these parts in [issue 1](https://github.com/GeniusDevam/littlebit-gguf/issues/1): the tensor names, the four metadata keys, the unpadded `lb_v`, the padded `lb_u`, and format versions 1 and 2. Two parts of this section are proposals of this project that have not been posted there yet: the `littlebit.x.*` key namespace and the mixture-of-experts layout. They are marked below.
 
 Shapes are given in ggml order: `ne[0]` is the contiguous dimension, the length of one row.
 
@@ -87,7 +87,7 @@ Shapes are given in ggml order: `ne[0]` is the contiguous dimension, the length 
 | `littlebit.residual` | bool | The file has a residual path for every projection. |
 | `littlebit.eff_bits` | float32 | Target bits per weight. Must be finite and above 0. |
 | `littlebit.use_itq` | bool | Informational. LittleBit-2 initialisation was used. |
-| `littlebit.x.*` | any | Implementation-specific. Loaders ignore every key in this namespace. |
+| `littlebit.x.*` | any | Implementation-specific. Loaders ignore every key in this namespace. Proposal, not yet agreed. |
 
 All other keys are the ones the stock llama.cpp converter writes for the architecture. Supported architectures are `llama`, `qwen2` and `qwen3`.
 
@@ -130,7 +130,7 @@ With `littlebit.residual`, the output is the sum of both paths. Any bias is adde
 
 ## Mixture of experts
 
-This part is defined so that implementations agree on it. This repository does not implement it. It does not load or run expert tensors yet.
+This part is a proposal of this project, not yet agreed with the other implementations, defined so that they can agree on it. This repository does not implement it. It does not load or run expert tensors yet.
 
 The stacked expert tensors `ffn_gate_exps`, `ffn_up_exps` and `ffn_down_exps` keep llama.cpp's own `[n_embd, n_ff, n_expert]` layout, with the expert index last. For each of them, with `n_expert` experts:
 
@@ -146,4 +146,4 @@ With `littlebit.residual`, `lb_g_r`, `lb_v_r` and `lb_u_r` hold the second path 
 - **Gate and up stay separate:** LittleBit does not use a merged `ffn_gate_up_exps` tensor, because the two projections have different factors.
 - **Router:** `ffn_gate_inp` is an ordinary tensor at normal precision.
 - **Shared experts:** `ffn_gate_shexp`, `ffn_up_shexp` and `ffn_down_shexp` are ordinary two-dimensional LittleBit projections, as above.
-- **Loaders without expert support:** a loader that has not implemented expert tensors must refuse a file that contains them, with a clear error, and must not guess a layout. The loader in this repository does this through its architecture check, because only `llama`, `qwen2` and `qwen3` are accepted.
+- **Loaders without expert support:** a loader that has not implemented expert tensors must refuse a file that contains them, with a clear error, and must not guess a layout. The loader in this repository does this in two steps. Its architecture check accepts only `llama`, `qwen2` and `qwen3`. That is not enough, because a `llama` file can have experts, so the loader also throws `LittleBit expert tensors are not supported: <tensor>` when any `ffn_*_exps.lb_*` tensor exists.

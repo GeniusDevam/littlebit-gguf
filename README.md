@@ -27,7 +27,7 @@ The patched graph uses ggml's existing `Q1_0` kernel and element-wise multiply.
 
 ## What it costs
 
-`Q1_0` needs each row length to be a multiple of 128, so the rank is padded up to the next multiple of 128 (padded rows get `d = 0` and add nothing), and each block carries 16 bits of scale. Estimated bits per weight for the compressed layers:
+`Q1_0` needs each row length to be a multiple of 128, so the rank is padded up to the next multiple of 128 (padded rows get `d = 0` and add nothing; with `--unpadded-v` only `lb_u` is padded, see below), and each block carries 16 bits of scale. Estimated bits per weight for the compressed layers:
 
 | Model | Trained at | In GGUF |
 |---|---|---|
@@ -72,7 +72,7 @@ Set `LITTLEBIT_BUILD_DIR` to an absolute path to put build output on another dri
 
 ### GPU builds (opt-in, untested here)
 
-The default build is CPU-only. `LITTLEBIT_CUDA=ON`, `LITTLEBIT_METAL=ON` and `LITTLEBIT_VULKAN=ON` turn on the matching llama.cpp backend, for example `LITTLEBIT_CUDA=ON bash scripts/build.sh`. **No GPU build has been tested by this project.** The development machine has no NVIDIA GPU, so these switches only pass the standard `GGML_CUDA`, `GGML_METAL` and `GGML_VULKAN` options to llama.cpp. For GPU results, see the CUDA runs that luben93 made with this tree: [perplexity and speed on an RTX A1000](https://github.com/luben93/littlebit-llamacpp/blob/5ca825f6f71e5c690cd2dc4326ff615d73667cda/results/geniusdevam/bench-cuda.tsv) and [the issue thread](https://github.com/GeniusDevam/littlebit-gguf/issues/1).
+The default build is CPU-only. `LITTLEBIT_CUDA=ON`, `LITTLEBIT_METAL=ON` and `LITTLEBIT_VULKAN=ON` turn on the matching llama.cpp backend, for example `LITTLEBIT_CUDA=ON bash scripts/build.sh`. **No GPU build has been tested by this project.** The development machine has no NVIDIA GPU, so these switches only pass the standard `GGML_CUDA`, `GGML_METAL` and `GGML_VULKAN` options to llama.cpp. For GPU results, see the CUDA runs that luben93 made with this tree: [speed on an RTX A1000](https://github.com/luben93/littlebit-llamacpp/blob/5ca825f6f71e5c690cd2dc4326ff615d73667cda/results/geniusdevam/bench-cuda.tsv) and [12-window perplexity](https://github.com/luben93/littlebit-llamacpp/blob/5ca825f6f71e5c690cd2dc4326ff615d73667cda/results/geniusdevam/ppl-8853f81-cuda-f16-12chunks.txt) (20.8654, built with `-DGGML_CUDA=ON` at revision 2) and [the issue thread](https://github.com/GeniusDevam/littlebit-gguf/issues/1).
 
 ## Convert and run
 
