@@ -1,4 +1,5 @@
 import hashlib
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -26,18 +27,25 @@ def git_apply(tree: Path, patch: Path) -> None:
     subprocess.run(["git", "apply", str(patch)], cwd=tree, check=True)
 
 
-def run_script(tree: Path) -> subprocess.CompletedProcess[str]:
+def run_script(
+    tree: Path, tmpdir: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    if tmpdir is not None:
+        env["TMPDIR"] = str(tmpdir)
     return subprocess.run(
-        ["bash", str(SCRIPT), str(tree)], capture_output=True, text=True, check=False
+        ["bash", str(SCRIPT), str(tree)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
     )
 
 
-@pytest.fixture
-def clean_tree(tmp_path: Path) -> Path:
+def extract_clean(tree: Path) -> Path:
     if not (LLAMA / "src").is_dir():
         pytest.skip("llama.cpp submodule is not checked out")
-    tree = tmp_path / "llama.cpp"
-    tree.mkdir()
+    tree.mkdir(parents=True)
     archive = subprocess.run(
         ["git", "-C", str(LLAMA), "archive", "HEAD", *touched()],
         capture_output=True,
@@ -45,6 +53,11 @@ def clean_tree(tmp_path: Path) -> Path:
     )
     subprocess.run(["tar", "-x", "-C", str(tree)], input=archive.stdout, check=True)
     return tree
+
+
+@pytest.fixture
+def clean_tree(tmp_path: Path) -> Path:
+    return extract_clean(tmp_path / "llama.cpp")
 
 
 @pytest.fixture
@@ -112,3 +125,28 @@ def test_conflicting_edit_stops_and_changes_nothing(
     assert result.returncode != 0
     assert re.search(r"error: 000\d-\S+\.diff does not apply", result.stderr)
     assert snapshot(clean_tree) == before
+
+
+def init_repository(path: Path) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return path
+
+
+@pytest.mark.parametrize("tmpdir_inside", [True, False])
+@pytest.mark.parametrize("target_inside", [True, False])
+def test_enclosing_repository_does_not_hide_the_patches(
+    tmp_path: Path,
+    patched_tree: dict[str, bytes],
+    tmpdir_inside: bool,
+    target_inside: bool,
+) -> None:
+    # git apply skips paths outside the current directory when it runs inside another repository
+    outer = init_repository(tmp_path / "outer")
+    tmpdir = outer / "tmp"
+    tmpdir.mkdir()
+    base = outer / "vendor" if target_inside else tmp_path / "elsewhere"
+    tree = extract_clean(base / "llama.cpp")
+    result = run_script(tree, tmpdir if tmpdir_inside else None)
+    assert result.returncode == 0, result.stderr
+    assert snapshot(tree) == patched_tree
