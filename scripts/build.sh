@@ -6,13 +6,7 @@ llama=third_party/llama.cpp
 build_dir=${LITTLEBIT_BUILD_DIR:-"$PWD/build"}
 git submodule update --init -- "$llama"
 
-for patch in "$PWD"/patches/*.diff; do
-    if git -C "$llama" apply --reverse --check "$patch" 2>/dev/null; then
-        continue
-    fi
-    git -C "$llama" apply --check "$patch"
-    git -C "$llama" apply "$patch"
-done
+bash "$PWD/scripts/apply-patches.sh" "$PWD/$llama"
 
 cmake -S "$llama" -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
