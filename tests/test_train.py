@@ -167,9 +167,13 @@ def test_train_resume_export(
     from test_runtime import FloatProjection
 
     for name in prefixes(teacher.config.num_hidden_layers):
-        reference.set_submodule(
-            name, FloatProjection(state, name, residual=True, q8_0=False)
-        )
+        projection = FloatProjection(state, name, residual=True, q8_0=False)
+        # The trainer stores V with the rank last. Some CPUs round a product with a
+        # transposed matrix differently, so give the reference the same layout.
+        projection.paths = [
+            (u, v.T.contiguous().T, *scales) for u, v, *scales in projection.paths
+        ]
+        reference.set_submodule(name, projection)
     dense = {
         name: value for name, value in state.items() if name in reference.state_dict()
     }
