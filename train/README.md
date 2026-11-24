@@ -19,8 +19,10 @@ To run the previous recipe in a fresh run, set `LEGACY_RECIPE = True` and `GRAD_
 A Kaggle run uses both T4s of the **GPU T4 x2** accelerator. This is the default and the only supported Kaggle mode. The notebook starts one process per GPU:
 
 ```sh
-python -m torch.distributed.run --standalone --nproc-per-node 2 -m train.train_qat --output run
+python -m torch.distributed.run --standalone --local-addr 127.0.0.1 --nproc-per-node 2 -m train.train_qat --output run
 ```
+
+`--local-addr` keeps the launcher from looking up the host name, which can hang for minutes before the trainer's own limits start.
 
 - **Split.** `--grad-accum` is the number of sequences per optimizer step and must be divisible by the number of processes (ranks). Rank r takes sequences `r, r + ranks, ...` of the step. Each rank scales its loss by `1 / grad_accum`, then the gradients are summed over the ranks before unscaling, clipping and the Adam update. With two sequences and two ranks this is the same single addition as accumulating both in one process, so the order of the data, the tokens per step and `resume.pt` are unchanged. With more sequences per rank the additions happen in another order and the results can differ in the last bits.
 - **Same start.** Rank 0 initializes or restores the student and sends its parameters, buffers, optimizer state, loss scale and random state to the other rank. Rank 0 alone reads `resume.pt`, downloads, tokenizes, prints and writes files.

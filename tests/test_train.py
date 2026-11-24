@@ -434,7 +434,7 @@ class Runner:
         command = [sys.executable, "-u"]
         if ranks > 1:
             command += ["-m", "torch.distributed.run", "--standalone"]
-            command += ["--nproc-per-node", str(ranks)]
+            command += ["--local-addr", "127.0.0.1", "--nproc-per-node", str(ranks)]
         command += [worker, "--tiny", "--cpu", "--seq-len", "16", "--tokens", "192"]
         command += ["--threads", "1", "--log-every", str(log_every)]
         command += ["--upstream", self.upstream]
@@ -864,10 +864,12 @@ def test_notebook_launches_two_ranks(
     )
     training = notebook.run(cells=3)[-1]
     start = training.index("torch.distributed.run")
-    assert training[start - 1 : start + 6] == [
+    assert training[start - 1 : start + 8] == [
         "-m",
         "torch.distributed.run",
         "--standalone",
+        "--local-addr",
+        "127.0.0.1",
         "--nproc-per-node",
         "2",
         "-m",
