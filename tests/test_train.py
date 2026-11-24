@@ -426,6 +426,7 @@ class Runner:
         resume: Path | None = None,
         root: Path = ROOT,
         seconds: int = 300,
+        log_every: int = 1,
         **faults: object,
     ) -> subprocess.CompletedProcess:
         worker = self.directory / f"{name}.py"
@@ -435,7 +436,8 @@ class Runner:
             command += ["-m", "torch.distributed.run", "--standalone"]
             command += ["--nproc-per-node", str(ranks)]
         command += [worker, "--tiny", "--cpu", "--seq-len", "16", "--tokens", "192"]
-        command += ["--threads", "1", "--log-every", "1", "--upstream", self.upstream]
+        command += ["--threads", "1", "--log-every", str(log_every)]
+        command += ["--upstream", self.upstream]
         command += ["--output", self.directory / name]
         if resume is not None:
             command += ["--resume", resume / "resume.pt"]
@@ -624,13 +626,36 @@ def test_overflow_is_shared(run_training: Runner) -> None:
 
 
 def test_divergent_parameters_stop(run_training: Runner) -> None:
-    result = run_training("diverge", ranks=2, diverge_at=2, check_every_step=True)
+    # A high log_every leaves only the check before each save to notice.
+    result = run_training(
+        "diverge", ranks=2, diverge_at=2, check_every_step=True, log_every=100
+    )
     assert result.returncode not in (0, None)
-    assert "1 tensors differ between ranks, first model.layers.0." in result.stdout
+    assert "1 tensors differ between ranks at step 2, first model." in result.stdout
     run = run_training.directory / "diverge"
     saved = torch.load(run / "resume.pt", map_location="cpu", weights_only=True)
     assert saved["step"] == 1
     assert not (run / "summary.json").exists()
+
+
+def test_divergence_after_first_update_stops(run_training: Runner) -> None:
+    result = run_training("diverge-first", ranks=2, diverge_at=1, log_every=4)
+    assert result.returncode not in (0, None)
+    assert "1 tensors differ between ranks at step 1, first model." in result.stdout
+    first = run_training.ok("diverge-resume-1", stop_at=1)
+    result = run_training(
+        "diverge-resume-2", ranks=2, resume=first, diverge_at=2, log_every=4
+    )
+    assert result.returncode not in (0, None)
+    assert "1 tensors differ between ranks at step 2, first model." in result.stdout
+
+
+def test_later_divergence_stops_at_log_interval(run_training: Runner) -> None:
+    result = run_training("diverge-later", ranks=2, diverge_at=3, log_every=4)
+    assert result.returncode not in (0, None)
+    assert "tensors differ between ranks at step 4, first model." in result.stdout
+    run = run_training.directory / "diverge-later"
+    assert not (run / "resume.pt").exists()
 
 
 def test_wrong_sequence_fails_first_step_check(run_training: Runner) -> None:

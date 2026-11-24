@@ -320,7 +320,7 @@ class Trainer:
             self.set_rng(header["rng"], header["cuda_rng"])
 
     def check_agreement(self) -> None:
-        self.ranks.check_equal(self.parameters)
+        self.ranks.check_equal(self.parameters, self.step)
 
     def cuda_rng(self) -> torch.Tensor | None:
         if not self.mixed_precision:
@@ -601,6 +601,9 @@ def train(args: argparse.Namespace, ranks: Ranks) -> None:
         positions = torch.arange(start, start + args.grad_accum) % len(order)
         loss, kl, mse = trainer.train_step(blocks[order[positions]], args.logit_chunk)
         last_step_seconds = time.monotonic() - step_start
+        # The step number alone decides, so every rank takes part in the same check.
+        if trainer.step == start_step + 1 or trainer.step % args.log_every == 0:
+            trainer.check_agreement()
         elapsed = time.monotonic() - train_start
         rate = (trainer.step - start_step) * tokens_per_step / elapsed
         latest = {

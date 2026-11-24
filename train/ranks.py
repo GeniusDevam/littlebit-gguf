@@ -194,7 +194,7 @@ class Ranks:
                 tensor.copy_(part.view_as(tensor))
 
     @torch.no_grad()
-    def check_equal(self, tensors: dict[str, torch.Tensor]) -> None:
+    def check_equal(self, tensors: dict[str, torch.Tensor], step: int) -> None:
         """Stop every rank if the same-named fp32 tensors differ in any rank."""
         if self.size == 1:
             return
@@ -214,5 +214,6 @@ class Ranks:
         ]
         if differing:
             raise RuntimeError(
-                f"{len(differing)} tensors differ between ranks, first {differing[0]}"
+                f"{len(differing)} tensors differ between ranks at step {step}, "
+                f"first {differing[0]}"
             )
