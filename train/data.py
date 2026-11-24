@@ -3,13 +3,12 @@ import json
 import shutil
 import tempfile
 from array import array
-from itertools import islice
+from collections.abc import Callable, Iterable, Iterator
+from itertools import batched, islice
 from pathlib import Path
-from typing import Callable
 
 import torch
 from huggingface_hub import hf_hub_download
-from pyarrow.parquet import read_table
 from transformers import PreTrainedTokenizerBase
 
 MODEL = "Qwen/Qwen3-0.6B"
@@ -17,11 +16,17 @@ MODEL_REV = "c1899de289a04d12100db370d81485cdf75e47ca"
 C4 = "allenai/c4"
 C4_REV = "1588ec454efa1a09f29cd18ddd04fe05fc8653a2"
 C4_SHARD = "en/c4-train.00000-of-01024.json.gz"
+C4_VALIDATION = "en/c4-validation.00000-of-00008.json.gz"
+# The first documents holding about as many tokens as the WikiText-2 test set.
+C4_VALIDATION_DOCUMENTS = 637
+C4_SEPARATOR = "\n\n"
 WIKI = "Salesforce/wikitext"
 WIKI_REV = "b08601e04326c79dfdd32d625aee71d232d685c3"
 
 
 def wikitext(split: str) -> str:
+    from pyarrow.parquet import read_table
+
     path = hf_hub_download(
         WIKI,
         f"wikitext-2-raw-v1/{split}-00000-of-00001.parquet",
@@ -32,24 +37,43 @@ def wikitext(split: str) -> str:
     return "\n\n".join(read_table(path, columns=["text"])["text"].to_pylist())
 
 
-def c4_tokens(tokenizer: PreTrainedTokenizerBase, limit: int) -> torch.Tensor:
-    path = hf_hub_download(
-        C4, C4_SHARD, repo_type="dataset", revision=C4_REV, token=False
-    )
-    separator = tokenizer("\n\n", add_special_tokens=False).input_ids
-    tokens = array("i")
+def c4_documents(shard: str) -> Iterator[str]:
+    path = hf_hub_download(C4, shard, repo_type="dataset", revision=C4_REV, token=False)
     with gzip.open(path, "rt", encoding="utf-8") as source:
-        while documents := [json.loads(row)["text"] for row in islice(source, 128)]:
-            ids = tokenizer(
-                documents, add_special_tokens=False, verbose=False
-            ).input_ids
-            for document in ids:
-                tokens.extend(document)
-                tokens.extend(separator)
-            if limit and len(tokens) >= limit:
-                del tokens[limit:]
-                break
+        for row in source:
+            yield json.loads(row)["text"]
+
+
+def join_documents(
+    tokenizer: PreTrainedTokenizerBase, documents: Iterable[str], limit: int = 0
+) -> torch.Tensor:
+    separator = tokenizer(C4_SEPARATOR, add_special_tokens=False).input_ids
+    tokens = array("i")
+    for batch in batched(documents, 128):
+        ids = tokenizer(list(batch), add_special_tokens=False, verbose=False).input_ids
+        for document in ids:
+            tokens.extend(document)
+            tokens.extend(separator)
+        if limit and len(tokens) >= limit:
+            del tokens[limit:]
+            break
     return torch.frombuffer(tokens, dtype=torch.int32)
+
+
+def c4_tokens(tokenizer: PreTrainedTokenizerBase, limit: int) -> torch.Tensor:
+    return join_documents(tokenizer, c4_documents(C4_SHARD), limit)
+
+
+def c4_validation_documents() -> list[str]:
+    documents = list(islice(c4_documents(C4_VALIDATION), C4_VALIDATION_DOCUMENTS))
+    if len(documents) != C4_VALIDATION_DOCUMENTS:
+        raise ValueError(f"expected {C4_VALIDATION_DOCUMENTS} C4 validation documents")
+    return documents
+
+
+def write_c4_validation(output: Path, documents: Iterable[str]) -> None:
+    text = "".join(document + C4_SEPARATOR for document in documents)
+    output.write_text(text, encoding="utf-8", newline="\n")
 
 
 def tokenize_corpus(
