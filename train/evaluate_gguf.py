@@ -22,6 +22,9 @@ def evaluate(results: Path, output: Path, threads: int) -> None:
         raise ValueError(
             f"check out training commit {summary['training_commit']} first"
         )
+    c4_validation = results / "c4-validation.txt"
+    if not c4_validation.is_file():
+        raise FileNotFoundError(c4_validation)
     output.mkdir(parents=True, exist_ok=False)
     llama = ROOT / "third_party" / "llama.cpp"
     labels = ("q8_0", "q4_k")
@@ -88,19 +91,20 @@ def evaluate(results: Path, output: Path, threads: int) -> None:
         write_wiki_test(wiki_test)
         for gguf in [dense, *(output / f"littlebit-{kind}.gguf" for kind in labels)]:
             print(f"{gguf.name}: {gguf.stat().st_size} bytes", file=log, flush=True)
-            run(
-                binaries / "llama-perplexity",
-                "-m",
-                gguf,
-                "-f",
-                wiki_test,
-                "-ngl",
-                "0",
-                "-t",
-                str(threads),
-                "-c",
-                "2048",
-            )
+            for text in (wiki_test, c4_validation):
+                run(
+                    binaries / "llama-perplexity",
+                    "-m",
+                    gguf,
+                    "-f",
+                    text,
+                    "-ngl",
+                    "0",
+                    "-t",
+                    str(threads),
+                    "-c",
+                    "2048",
+                )
         run(
             binaries / "llama-cli",
             "-m",
