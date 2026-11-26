@@ -185,7 +185,7 @@ These runs are luben93's, not reproduced here, because this project has no GPU. 
 
 ## Trained Qwen3-0.6B against same-size models
 
-This project trained Qwen3-0.6B itself with quantization-aware training and distillation from the original model: 99.2M tokens of WikiText-2 train (repeated four times) and one C4 train shard, on two Kaggle T4 GPUs, with the trainer on the [`train-r3` branch](https://github.com/GeniusDevam/littlebit-gguf/tree/e593d6553ef640d0a09ce85f49fc31d4f73286b6/train). The projections are 0.6792 bits per weight in `Q1_0` and the embeddings Q4_K, 131 MB in total. The checkpoint and the GGUF are in the [`littlebit-qwen3-0.6b-v1` release](https://github.com/GeniusDevam/littlebit-gguf/releases/tag/littlebit-qwen3-0.6b-v1). It is a research model: read the results below before using it.
+This project trained Qwen3-0.6B itself with quantization-aware training and distillation from the original model: 99.2M tokens of WikiText-2 train (repeated four times) and one C4 train shard, on two Kaggle T4 GPUs, with the trainer on the [`train-r3` branch](https://github.com/GeniusDevam/littlebit-gguf/tree/e593d6553ef640d0a09ce85f49fc31d4f73286b6/train). The projections are 0.6792 bits per weight in `Q1_0` and the embeddings Q4_K, 131 MB in total. The checkpoint and the GGUF are in the [`littlebit-qwen3-0.6b-v1` release](https://github.com/GeniusDevam/littlebit-gguf/releases/tag/littlebit-qwen3-0.6b-v1) and on Hugging Face as [`DaddyDevam/littlebit-qwen3-0.6b`](https://huggingface.co/DaddyDevam/littlebit-qwen3-0.6b). It is a research model: read the results below before using it.
 
 It was compared on three texts with models of a similar or larger file size. Two texts are unlike its training data:
 
